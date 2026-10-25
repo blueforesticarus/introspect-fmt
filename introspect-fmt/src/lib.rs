@@ -11,7 +11,16 @@
 
 use std::{any::type_name, fmt, marker::PhantomData};
 
-pub use introspect_fmt_macros::inspect_format;
+/// Capture ordinary formatting inputs without moving their values.
+/// The wrapper supplies its defining crate hygienically, including through
+/// dependency aliases and downstream re-exports.
+#[macro_export]
+macro_rules! inspect_format {
+    ($($input:tt)*) => {
+        // Forward token trees so caller literals and expressions keep their spans.
+        $crate::__private::__inspect_format!(($crate) $($input)*)
+    };
+}
 
 mod render;
 pub use render::RenderError;
@@ -198,6 +207,10 @@ impl<'a> Format<'a> {
 pub mod __private {
     use super::*;
 
+    // Public only because downstream wrapper expansions must reach this entry.
+    #[doc(hidden)]
+    pub use introspect_fmt_macros::inspect_format as __inspect_format;
+
     // A function bound supplies the closure's input type before Rust checks its
     // body; immediately calling an untyped closure does not provide that context.
     pub fn invoke<'a, R>(view: Format<'a>, callback: impl FnOnce(Format<'a>) -> R) -> R {
@@ -367,5 +380,24 @@ pub mod __private {
                 _lifetime: PhantomData,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn macro_resolves_its_defining_crate_for_internal_calls() {
+        let captured = String::from("internal");
+        crate::inspect_format!(
+            |view| {
+                assert!(
+                    matches!(view.args()[1].value(), crate::Value::Str(value) if *value == "internal")
+                );
+                let independent = crate::Format::new(view.template(), view.args(), None);
+                assert_eq!(independent.render().unwrap(), "internal 42");
+            },
+            "{captured} {}",
+            42
+        );
     }
 }

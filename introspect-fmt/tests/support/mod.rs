@@ -28,6 +28,14 @@ macro_rules! parity {
 // the remaining output tests from running. Both sides must actually compile;
 // a rejection by the prototype is a normal test failure, not an expected pass.
 pub fn assert_compiles_and_renders(name: &str, source: &str, dependency_name: &str) {
+    assert_compiler_fixture(name, source, dependency_name, false);
+}
+
+pub fn assert_reexported_compiles_and_renders(name: &str, source: &str) {
+    assert_compiler_fixture(name, source, "facade_fmt", true);
+}
+
+fn assert_compiler_fixture(name: &str, source: &str, dependency_name: &str, reexport: bool) {
     struct Scratch(PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -55,6 +63,39 @@ pub fn assert_compiles_and_renders(name: &str, source: &str, dependency_name: &s
         })
         .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
         .expect("Cargo-built introspect_fmt library");
+    let library = if reexport {
+        // The client receives only this facade, with no direct runtime dependency.
+        // Runtime paths in the expanded macro must still resolve to its owner.
+        let facade_source = scratch.0.join("facade.rs");
+        fs::write(&facade_source, "// Reexport the public API without exposing a runtime crate name.\npub use private_runtime::{inspect_format, Format};\n").unwrap();
+        let facade_library = scratch.0.join("libintrospect_fmt_facade.rlib");
+        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .env_remove("RUSTFLAGS")
+            .args([
+                "--edition=2021",
+                "--crate-name",
+                "introspect_fmt_facade",
+                "--crate-type",
+                "rlib",
+            ])
+            .arg(&facade_source)
+            .arg("--extern")
+            .arg(format!("private_runtime={}", library.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", deps.display()))
+            .arg("-o")
+            .arg(&facade_library)
+            .output()
+            .expect("compile facade");
+        assert!(
+            output.status.success(),
+            "cannot compile facade:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        facade_library
+    } else {
+        library
+    };
     let mut oracle_stdout = None;
     for prototype in [false, true] {
         let replacement = if prototype {

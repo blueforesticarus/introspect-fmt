@@ -2,11 +2,13 @@
 //! validating/rendering only when doing so cannot alter argument capture.
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
 use syn::{
-    parse::{Parse, ParseStream},
+    ext::IdentExt,
+    parenthesized,
+    parse::{Parse, ParseStream, Parser},
     parse_macro_input, Expr, ExprClosure, ExprLit, Ident, Lit, LitStr, Result, Token,
 };
 
@@ -15,12 +17,18 @@ enum InputArg {
     Named(Ident, Expr),
 }
 struct Invocation {
+    runtime: TokenStream2,
     callback: ExprClosure,
     format: Expr,
     args: Vec<InputArg>,
 }
 impl Parse for Invocation {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
+        // The public wrapper supplies ($crate). Keep these hygienic tokens,
+        // rather than printing/reparsing a path or consulting Cargo manifests.
+        let runtime_group;
+        parenthesized!(runtime_group in input);
+        let runtime = runtime_group.parse()?;
         let callback = input.parse::<ExprClosure>()?;
         input.parse::<Token![,]>()?;
         let format = input.parse::<Expr>()?;
@@ -30,8 +38,16 @@ impl Parse for Invocation {
             if input.is_empty() {
                 break;
             }
-            if input.peek(Ident) && input.peek2(Token![=]) {
-                let name = input.parse::<Ident>()?;
+            // Rust's formatting grammar allows keyword argument names too.
+            // Parse the label before interpreting any token as an expression.
+            // A positional comparison such as `true == false` also starts
+            // with identifier-like tokens; only a single '=' introduces a name.
+            if input.peek(Ident::peek_any)
+                && input.peek2(Token![=])
+                && !input.peek2(Token![==])
+                && !input.peek2(Token![=>])
+            {
+                let name = input.call(Ident::parse_any)?;
                 input.parse::<Token![=]>()?;
                 args.push(InputArg::Named(name, input.parse()?));
             } else {
@@ -39,6 +55,7 @@ impl Parse for Invocation {
             }
         }
         Ok(Self {
+            runtime,
             callback,
             format,
             args,
@@ -210,11 +227,27 @@ fn analyze_format(fmt: &str) -> FormatInfo {
     info
 }
 
-fn valid_ident(s: &str) -> bool {
-    !s.is_empty() && s != "_" && syn::parse_str::<Ident>(s).is_ok()
+// Format names are IDENTIFIER_OR_KEYWORD, except bare `_`. Use the same
+// parser for invocation labels, placeholder names, and dynamic count names.
+fn parse_format_ident(name: &str) -> Option<Ident> {
+    if name.is_empty() || name == "_" {
+        return None;
+    }
+    Ident::parse_any.parse_str(name).ok()
+}
+fn valid_ident(name: &str) -> bool {
+    parse_format_ident(name).is_some()
+}
+fn argument_name(ident: &Ident) -> String {
+    // `type = ...` and `r#type = ...` both bind the format name "type".
+    ident.unraw().to_string()
 }
 
-fn captured_value(temp: &Ident, required: Option<&RequiredTraits>) -> proc_macro2::TokenStream {
+fn captured_value(
+    runtime: &TokenStream2,
+    temp: &Ident,
+    required: Option<&RequiredTraits>,
+) -> TokenStream2 {
     let display = required
         .filter(|traits| traits.display)
         .map(|_| quote! { .display() });
@@ -222,24 +255,25 @@ fn captured_value(temp: &Ident, required: Option<&RequiredTraits>) -> proc_macro
         .filter(|traits| traits.debug)
         .map(|_| quote! { .debug() });
     quote! {
-        ::introspect_fmt::__private::Formatters::new(&#temp)
+        #runtime::__private::Formatters::new(&#temp)
             #display #debug
-            .attach(::introspect_fmt::__private::Probe::new(#temp).__introspect_fmt_capture())
+            .attach(#runtime::__private::Probe::new(#temp).__introspect_fmt_capture())
     }
 }
 
 #[proc_macro]
 pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     let Invocation {
+        runtime,
         callback,
         format,
         args,
     } = parse_macro_input!(tokens as Invocation);
-    let literal = match &format {
+    let (literal, capture_span) = match &format {
         Expr::Lit(ExprLit {
             lit: Lit::Str(s), ..
-        }) => Some(s.value()),
-        _ => None,
+        }) => (Some(s.value()), s.span()),
+        _ => (None, Span::call_site()),
     };
     let info = literal.as_ref().map(|text| analyze_format(text));
     let mut bound = Vec::new();
@@ -252,7 +286,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         let (name, expr) = match arg {
             InputArg::Positional(expr) => (None, expr),
             InputArg::Named(ident, expr) => {
-                explicitly_named.insert(ident.to_string());
+                explicitly_named.insert(argument_name(ident));
                 (Some(ident), expr)
             }
         };
@@ -265,15 +299,16 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         let mut is_count = false;
         if let Some(info) = &info {
             let positional = info.traits.get(&ArgumentKey::Position(i));
-            let named = name.and_then(|name| info.traits.get(&ArgumentKey::Name(name.to_string())));
+            let named =
+                name.and_then(|name| info.traits.get(&ArgumentKey::Name(argument_name(name))));
             for traits in positional.into_iter().chain(named) {
                 required.display |= traits.display;
                 required.debug |= traits.debug;
             }
             is_count = info.count_positions.contains(&i)
-                || name.is_some_and(|name| info.count_names.contains(&name.to_string()));
+                || name.is_some_and(|name| info.count_names.contains(&argument_name(name)));
         }
-        let captured = captured_value(&temp, Some(&required));
+        let captured = captured_value(&runtime, &temp, Some(&required));
         if is_count {
             bound.push(quote! { let #temp: &usize = &(#expr); });
         } else {
@@ -282,15 +317,15 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         let text = LitStr::new(&quote!(#expr).to_string(), Span::call_site());
         let label = match name {
             Some(name) => {
-                let label = LitStr::new(&name.to_string(), Span::call_site());
+                let label = LitStr::new(&argument_name(name), Span::call_site());
                 quote! { Some(#label) }
             }
             None => quote! { None },
         };
         descriptors.push(quote! {
-            ::introspect_fmt::FormatArg::new(
+            #runtime::FormatArg::new(
                 #label, #text,
-                ::introspect_fmt::__private::rust_type_name(#temp),
+                #runtime::__private::rust_type_name(#temp),
                 #captured
             )
         });
@@ -299,7 +334,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         let fmt_value = if is_count {
             quote! { *#temp }
         } else {
-            quote! { ::introspect_fmt::__private::Render::new(#temp) }
+            quote! { #runtime::__private::Render::new(#temp) }
         };
         fmt_args.push(match name {
             Some(name) => quote! { #name = #fmt_value },
@@ -314,9 +349,19 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             if explicitly_named.contains(name) {
                 continue;
             }
-            let Ok(ident) = syn::parse_str::<Ident>(name) else {
+            let Some(mut ident) = parse_format_ident(name) else {
                 continue;
             };
+            // A captured keyword variable is spelled r#keyword in Rust code;
+            // receiver/path keywords cannot be raw and retain their spelling.
+            if syn::parse_str::<Ident>(name).is_err()
+                && !matches!(name.as_str(), "self" | "Self" | "crate" | "super")
+            {
+                ident = Ident::new_raw(name, capture_span);
+            }
+            // The proc-macro call site is inside the wrapper. The literal's
+            // original span instead resolves captures in the user's scope.
+            ident.set_span(capture_span);
             let temp = format_ident!("__introspect_fmt_implicit_{}", i, span = Span::mixed_site());
             if info.count_names.contains(name) {
                 bound.push(quote! { let #temp: &usize = &#ident; });
@@ -326,15 +371,19 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             let fmt_value = if info.count_names.contains(name) {
                 quote! { *#temp }
             } else {
-                quote! { ::introspect_fmt::__private::Render::new(#temp) }
+                quote! { #runtime::__private::Render::new(#temp) }
             };
             fmt_args.push(quote! { #ident = #fmt_value });
             let label = LitStr::new(name, Span::call_site());
-            let captured = captured_value(&temp, info.traits.get(&ArgumentKey::Name(name.clone())));
+            let captured = captured_value(
+                &runtime,
+                &temp,
+                info.traits.get(&ArgumentKey::Name(name.clone())),
+            );
             descriptors.push(quote! {
-                ::introspect_fmt::FormatArg::new(
+                #runtime::FormatArg::new(
                     Some(#label), #label,
-                    ::introspect_fmt::__private::rust_type_name(#temp),
+                    #runtime::__private::rust_type_name(#temp),
                     #captured
                 )
             });
@@ -352,13 +401,13 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {{
-        use ::introspect_fmt::__private::Capture as _;
+        use #runtime::__private::Capture as _;
         // Nonliteral templates are evaluated here exactly once; only inert
         // direct literals are also passed to the compiler's format_args!.
         let __introspect_fmt_template: &'static str = #format;
         #(#bound)*
         let __introspect_fmt_values = [#(#descriptors),*];
-        ::introspect_fmt::__private::invoke(::introspect_fmt::Format::new(
+        #runtime::__private::invoke(#runtime::Format::new(
             __introspect_fmt_template,
             &__introspect_fmt_values,
             #rendered,

@@ -226,3 +226,44 @@ fn extension_templates_and_unsized_values_keep_borrowing_semantics() {
         *erased
     );
 }
+
+#[test]
+fn keyword_names_preserve_hooks_borrows_and_count_inference() {
+    // A keyword label is metadata, not a Rust expression. Only its value is
+    // evaluated, once, and raw labels have the same canonical name.
+    struct DisplayOnly<'a>(&'a str);
+    impl fmt::Display for DisplayOnly<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+    #[derive(Debug)]
+    struct DebugOnly;
+    let owned = String::from("borrowed");
+    let mut value = DisplayOnly(&owned);
+    let mut calls = 0;
+    inspect_format!(|view| {
+        assert_eq!(view.args().iter().map(|arg| arg.name()).collect::<Vec<_>>(),
+            [Some("type"), Some("self")]);
+        assert_eq!(view.args()[0].type_name(), std::any::type_name::<&mut DisplayOnly<'_>>());
+        let Value::Opaque(display) = view.args()[0].value() else { panic!("expected opaque") };
+        let Value::Opaque(debug) = view.args()[1].value() else { panic!("expected opaque") };
+        assert_eq!(display.display().as_deref(), Some("borrowed"));
+        assert_eq!(display.debug(), None);
+        assert_eq!(debug.display(), None);
+        assert_eq!(debug.debug().as_deref(), Some("DebugOnly"));
+        let independent = introspect_fmt::Format::new(view.template(), view.args(), None);
+        assert_eq!(independent.render().unwrap(), "borrowed DebugOnly borrowed");
+    }, "{type} {self:?} {type}", type = { calls += 1; &mut value }, self = DebugOnly);
+    assert_eq!(calls, 1);
+    assert_eq!(value.0, owned);
+
+    // Keyword count operands keep usize inference, including raw spellings.
+    // Width/precision rendering is a separate, still unsupported capability.
+    inspect_format!(|view| {
+        assert_eq!(view.args().iter().map(|arg| arg.name()).collect::<Vec<_>>(),
+            [Some("type"), Some("async"), Some("value")]);
+        assert!(matches!(view.args()[0].value(), Value::Usize(value) if **value == 8));
+        assert!(matches!(view.args()[1].value(), Value::Usize(value) if **value == 2));
+    }, "{value:type$.async$}", r#type = 8, async = 2, value = 1.25);
+}

@@ -163,6 +163,46 @@ fn compiler_fixture_checks_both_compilation_and_output() {
     );
 }
 
+#[test]
+fn raw_identifier_names() {
+    parity!("{type}", r#type = 42);
+}
+
+#[test]
+fn keyword_named_arguments_compile() {
+    support::assert_compiles_and_renders(
+        "keywords",
+        include_str!("fixtures/keyword_named.rs"),
+        "introspect_fmt",
+    );
+}
+
+#[test]
+fn implicit_receiver_capture() {
+    support::assert_compiles_and_renders(
+        "receiver",
+        include_str!("fixtures/receiver_capture.rs"),
+        "introspect_fmt",
+    );
+}
+
+#[test]
+fn renamed_dependency_compiles() {
+    support::assert_compiles_and_renders(
+        "renamed",
+        include_str!("fixtures/renamed_dependency.rs"),
+        "renamed_fmt",
+    );
+}
+
+#[test]
+fn reexported_macro_without_direct_runtime_dependency() {
+    support::assert_reexported_compiles_and_renders(
+        "reexported",
+        include_str!("fixtures/renamed_dependency.rs"),
+    );
+}
+
 // Keep each unsupported capability visible as a failing assertion of the same
 // contract. Do not mark these ignored, should_panic, or assert errors as success.
 mod unsupported {
@@ -275,34 +315,6 @@ mod unsupported {
         let value = DisplayOnly("custom");
         assert_eq!(fmt::format(format_args!("{}", value)), "custom");
         forward!("{}", value);
-    }
-    #[test]
-    fn raw_identifier_names() {
-        parity!("{type}", r#type = 42);
-    }
-    #[test]
-    fn keyword_named_arguments_compile() {
-        support::assert_compiles_and_renders(
-            "keywords",
-            include_str!("fixtures/keyword_named.rs"),
-            "introspect_fmt",
-        );
-    }
-    #[test]
-    fn implicit_receiver_capture() {
-        support::assert_compiles_and_renders(
-            "receiver",
-            include_str!("fixtures/receiver_capture.rs"),
-            "introspect_fmt",
-        );
-    }
-    #[test]
-    fn renamed_dependency_compiles() {
-        support::assert_compiles_and_renders(
-            "renamed",
-            include_str!("fixtures/renamed_dependency.rs"),
-            "renamed_fmt",
-        );
     }
 
     // Each trait-only type is independent: no Display or Debug implementation
