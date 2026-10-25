@@ -6,6 +6,9 @@ mod support;
 use introspect_fmt::inspect_format;
 use std::fmt;
 
+// Keep adversarial contract cases separate so new gaps remain easy to rerun.
+mod adversarial;
+
 #[test]
 fn basic_usage() {
     parity!("");
@@ -203,39 +206,127 @@ fn reexported_macro_without_direct_runtime_dependency() {
     );
 }
 
-// Keep each unsupported capability visible as a failing assertion of the same
-// contract. Do not mark these ignored, should_panic, or assert errors as success.
-mod unsupported {
+#[test]
+fn explicit_sign() {
+    parity!("{:+} {:+} {:-}", 42, -42, 42);
+}
+
+#[test]
+fn alternate_radix_prefixes() {
+    parity!("{:#x} {:#X} {:#b} {:#o}", 42, 42, 42, 42);
+}
+
+#[test]
+fn float_precision_and_rounding() {
+    parity!("{:.1} {:.1}", 1.25, 1.75);
+}
+
+#[test]
+fn string_precision_counts_unicode_characters() {
+    parity!("{:.3}", "é🦀abc");
+}
+
+#[test]
+fn forwarded_literal_retains_custom_formatters() {
+    // macro_rules! forwarding wraps a literal in an invisible token group.
+    macro_rules! forward {
+        ($template:literal, $value:expr) => {
+            inspect_format!(
+                |view| {
+                    support::assert_rendered(&view, "custom");
+                },
+                $template,
+                $value
+            )
+        };
+    }
+    let value = DisplayOnly("custom");
+    assert_eq!(fmt::format(format_args!("{}", value)), "custom");
+    forward!("{}", value);
+}
+
+#[test]
+fn literal_width_and_alignment() {
+    parity!("[{:8}] [{:<8}] [{:^8}] [{:>8}]", "x", "x", "x", "x");
+}
+
+#[test]
+fn unicode_fill() {
+    parity!("{:🦀^8}", "é");
+}
+
+#[test]
+fn sign_aware_zero_padding() {
+    parity!("{:08} {:08}", 42, -42);
+    // Padding must follow signs/prefixes and retain Rust's primitive semantics.
+    parity!("{:+08} {:#08x} {:#08X} {:#012b} {:#06o}", 42, 42, 42, 5, 9);
+    parity!("{:08.2} {:08.2} {:08}", -1.25, -0.0, f64::INFINITY);
+    parity!("{:🦀<08} {:^08}", -42, 42);
+}
+
+#[test]
+fn primitive_padding_combines_with_precision_and_counts_characters() {
+    // Odd center padding puts the extra fill on the right; precision precedes width.
+    parity!("[{:🦀^8.2}] [{:>6.3}] [{:2}]", "é🦀abc", "é🦀abc", "long");
+    parity!("[{:8}] [{:<8}] [{:^8}] [{:>8}]", -42, -42, -42, -42);
+    parity!("[{:8}] [{:🦀^8}] [{:08}]", true, 'é', "x");
+    parity!("[{:10.2}] [{:🦀<10.2}] [{:#10x}]", 1.25, -1.25, 42);
+}
+
+// Shared capabilities use identical parity assertions with either backend.
+mod traits_and_counts {
     use super::*;
 
     #[test]
-    fn literal_width_and_alignment() {
-        parity!("[{:8}] [{:<8}] [{:^8}] [{:>8}]", "x", "x", "x", "x");
+    fn value_and_count_expressions_are_evaluated_once() {
+        let mut value_calls = 0;
+        let mut count_calls = 0;
+        inspect_format!(
+            |view| support::assert_rendered(&view, "     abc"),
+            "{:>width$.3}",
+            {
+                value_calls += 1;
+                DisplayOnly("abcdef")
+            },
+            width = {
+                count_calls += 1;
+                8
+            }
+        );
+        assert_eq!((value_calls, count_calls), (1, 1));
     }
+
     #[test]
-    fn unicode_fill() {
-        parity!("{:🦀^8}", "é");
+    fn custom_observes_absent_and_explicit_zero_counts() {
+        struct Counts;
+        impl fmt::Display for Counts {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Passing zero for an absent option would change custom behavior.
+                let counts = (formatter.width(), formatter.precision(), formatter.align());
+                write!(formatter, "{counts:?}")
+            }
+        }
+        parity!("{0} {0:.0} {0:0$} {0:>.0}", 0usize);
+        parity!("{0} {0:.0} {0:width$} {0:>.0}", Counts, width = 0);
     }
+
     #[test]
-    fn explicit_sign() {
-        parity!("{:+} {:+} {:-}", 42, -42, 42);
+    fn custom_observes_simple_sign_and_alternate_flags() {
+        struct Flags;
+        impl fmt::Display for Flags {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Verify forwarding flags rather than assuming numeric output.
+                let flags = (
+                    formatter.sign_plus(),
+                    formatter.sign_minus(),
+                    formatter.alternate(),
+                );
+                write!(formatter, "{flags:?}")
+            }
+        }
+        parity!("{0} {0:+} {0:-} {0:#} {0:+#} {0:-#}", Flags);
     }
-    #[test]
-    fn sign_aware_zero_padding() {
-        parity!("{:08} {:08}", 42, -42);
-    }
-    #[test]
-    fn alternate_radix_prefixes() {
-        parity!("{:#x} {:#X} {:#b} {:#o}", 42, 42, 42, 42);
-    }
-    #[test]
-    fn float_precision_and_rounding() {
-        parity!("{:.1} {:.1}", 1.25, 1.75);
-    }
-    #[test]
-    fn string_precision_counts_unicode_characters() {
-        parity!("{:.3}", "é🦀abc");
-    }
+
     #[test]
     fn dynamic_width_positional() {
         parity!("{1:0$}", 8, "x");
@@ -294,29 +385,6 @@ mod unsupported {
     fn custom_display_receives_width_and_precision() {
         parity!("{:>8.3}", DisplayOnly("abcdef"));
     }
-    #[test]
-    fn macro_generated_template_retains_custom_formatters() {
-        parity!(concat!("value=", "{}"), DisplayOnly("custom"));
-    }
-    #[test]
-    fn forwarded_literal_retains_custom_formatters() {
-        // macro_rules! forwarding wraps a literal in an invisible token group.
-        macro_rules! forward {
-            ($template:literal, $value:expr) => {
-                inspect_format!(
-                    |view| {
-                        support::assert_rendered(&view, "custom");
-                    },
-                    $template,
-                    $value
-                )
-            };
-        }
-        let value = DisplayOnly("custom");
-        assert_eq!(fmt::format(format_args!("{}", value)), "custom");
-        forward!("{}", value);
-    }
-
     // Each trait-only type is independent: no Display or Debug implementation
     // can accidentally make these pass via a fallback to a different trait.
     macro_rules! trait_only_case {
@@ -340,4 +408,88 @@ mod unsupported {
     trait_only_case!(custom_lower_exp, LowerExp, "{:e}");
     trait_only_case!(custom_upper_exp, UpperExp, "{:E}");
     trait_only_case!(custom_pointer, Pointer, "{:p}");
+}
+
+// Run these in BOTH configurations: exact parity passes with nightly and stays
+// visibly red without it. Never cfg away, ignore, or expect a failure as success.
+mod nightly_required {
+    use super::*;
+
+    #[test]
+    fn macro_generated_template_retains_custom_formatters() {
+        // All these templates must retain hooks without evaluating user formatting.
+        parity!(concat!("value=", "{}"), DisplayOnly("custom"));
+        parity!(include_str!("fixtures/template.txt"), DisplayOnly("custom"));
+        parity!(concat!("{0}", " {0:?}"), Dual("custom"));
+    }
+
+    #[test]
+    fn macro_generated_template_preserves_trait_selection_and_counts() {
+        struct HexOnly(u32);
+        impl fmt::LowerHex for HexOnly {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // A Display or Debug requirement would reject this argument.
+                fmt::LowerHex::fmt(&self.0, formatter)
+            }
+        }
+        macro_rules! template {
+            () => {
+                concat!("{0:🦀>+#width$x}", " {0:0width$x}")
+            };
+        }
+        // Unsuffixed counts must be inferred as usize after expansion.
+        parity!(template!(), HexOnly(171), width = 12);
+        parity!(concat!("{:.*}", " {}"), 3, DisplayOnly("abcdef"), "tail");
+    }
+
+    #[test]
+    fn custom_display_observes_all_options() {
+        struct Options;
+        impl fmt::Display for Options {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Inspect flags rather than just padding a constant string.
+                let options = (
+                    formatter.fill(),
+                    formatter.align(),
+                    formatter.sign_plus(),
+                    formatter.sign_minus(),
+                    formatter.alternate(),
+                    formatter.sign_aware_zero_pad(),
+                    formatter.width(),
+                    formatter.precision(),
+                );
+                write!(formatter, "{options:?}")
+            }
+        }
+        parity!("{:🦀^+#012.3}", Options);
+        parity!(
+            "{:🦀>-#width$.precision$}",
+            Options,
+            width = 11,
+            precision = 0
+        );
+    }
+
+    #[test]
+    fn custom_radix_receives_dynamic_counts_and_flags() {
+        // No Display or Debug implementation: only the requested trait may be required.
+        struct HexOnly(u32);
+        impl fmt::LowerHex for HexOnly {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.0, formatter)
+            }
+        }
+        parity!("{0:🦀>+#width$x} {0:🦀<#width$x}", HexOnly(171), width = 12);
+    }
+
+    #[test]
+    fn debug_receives_combined_options() {
+        parity!("{:🦀>+#012.3x?}", vec![171, 42]);
+        parity!(
+            "{:🦀^#width$.precision$X?}",
+            Some(171),
+            width = 12,
+            precision = 3
+        );
+    }
 }

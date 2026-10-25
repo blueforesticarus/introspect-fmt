@@ -9,6 +9,8 @@
 //! a call involving `&mut T` creates *shared* references to the resulting
 //! `&mut T` value, never a second exclusive borrow.
 
+#![cfg_attr(feature = "nightly", feature(formatting_options))]
+
 use std::{any::type_name, fmt, marker::PhantomData};
 
 /// Capture ordinary formatting inputs without moving their values.
@@ -22,7 +24,9 @@ macro_rules! inspect_format {
     };
 }
 
+mod formatting;
 mod render;
+mod spec;
 pub use render::RenderError;
 
 /// Each argument in its original macro order, followed by any implicitly
@@ -33,6 +37,9 @@ pub struct FormatArg<'a> {
     expression: &'static str,
     rust_type_name: &'static str,
     value: Value<'a>,
+    // Preserve original trait dispatch even when Value normalizes a reference
+    // into a primitive. In particular, Pointer must see the original type.
+    formatting: Option<formatting::Formatting<'a>>,
 }
 
 impl<'a> FormatArg<'a> {
@@ -48,7 +55,14 @@ impl<'a> FormatArg<'a> {
             expression,
             rust_type_name,
             value,
+            formatting: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_formatting(mut self, formatting: formatting::Formatting<'a>) -> Self {
+        self.formatting = Some(formatting);
+        self
     }
 
     pub fn name(&self) -> Option<&'static str> {
@@ -206,6 +220,10 @@ impl<'a> Format<'a> {
 #[doc(hidden)]
 pub mod __private {
     use super::*;
+
+    // Safe builders are reachable by downstream macro expansions; erased
+    // pointers and their monomorphized thunks remain private to the runtime.
+    pub use crate::formatting::Formatters as TraitFormatters;
 
     // Public only because downstream wrapper expansions must reach this entry.
     #[doc(hidden)]

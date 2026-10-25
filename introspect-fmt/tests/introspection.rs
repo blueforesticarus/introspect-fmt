@@ -212,7 +212,9 @@ fn extension_templates_and_unsized_values_keep_borrowing_semantics() {
         |view| {
             assert!(matches!(view.args()[0].value(), Value::Opaque(_)));
         },
-        concat!("{", "}"),
+        // A runtime block keeps this extension outside literal analysis in both
+        // modes; nightly macro templates now enforce their formatting traits.
+        { "{}" },
         NoTraits
     );
     let owned = String::from("dynamic");

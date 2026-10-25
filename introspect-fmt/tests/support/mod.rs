@@ -46,30 +46,15 @@ fn assert_compiler_fixture(name: &str, source: &str, dependency_name: &str, reex
         Scratch(std::env::temp_dir().join(format!("introspect-fmt-{}-{name}", std::process::id())));
     fs::create_dir_all(&scratch.0).unwrap();
     let executable = std::env::current_exe().unwrap();
-    let deps = executable.parent().unwrap();
-    // Use the library Cargo just built, rather than launching nested Cargo and
-    // contending with its target lock. Honor custom target directories/profiles.
-    let library = fs::read_dir(deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("libintrospect_fmt-")
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "rlib")
-        })
-        .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
-        .expect("Cargo-built introspect_fmt library");
+    let (library, dependencies) = cargo_artifacts(&executable);
     let library = if reexport {
         // The client receives only this facade, with no direct runtime dependency.
         // Runtime paths in the expanded macro must still resolve to its owner.
         let facade_source = scratch.0.join("facade.rs");
         fs::write(&facade_source, "// Reexport the public API without exposing a runtime crate name.\npub use private_runtime::{inspect_format, Format};\n").unwrap();
         let facade_library = scratch.0.join("libintrospect_fmt_facade.rlib");
-        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        let mut rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+        rustc
             .env_remove("RUSTFLAGS")
             .args([
                 "--edition=2021",
@@ -81,12 +66,15 @@ fn assert_compiler_fixture(name: &str, source: &str, dependency_name: &str, reex
             .arg(&facade_source)
             .arg("--extern")
             .arg(format!("private_runtime={}", library.display()))
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()))
             .arg("-o")
-            .arg(&facade_library)
-            .output()
-            .expect("compile facade");
+            .arg(&facade_library);
+        add_metadata(&mut rustc, "private_runtime", &library);
+        for dependency in &dependencies {
+            rustc
+                .arg("-L")
+                .arg(format!("dependency={}", dependency.display()));
+        }
+        let output = rustc.output().expect("compile facade");
         assert!(
             output.status.success(),
             "cannot compile facade:\n{}",
@@ -125,9 +113,13 @@ fn assert_compiler_fixture(name: &str, source: &str, dependency_name: &str, reex
         if prototype {
             rustc
                 .arg("--extern")
-                .arg(format!("{dependency_name}={}", library.display()))
-                .arg("-L")
-                .arg(format!("dependency={}", deps.display()));
+                .arg(format!("{dependency_name}={}", library.display()));
+            add_metadata(&mut rustc, dependency_name, &library);
+            for dependency in &dependencies {
+                rustc
+                    .arg("-L")
+                    .arg(format!("dependency={}", dependency.display()));
+            }
         }
         let output = rustc.output().expect("run rustc");
         assert!(
@@ -158,4 +150,87 @@ fn assert_compiler_fixture(name: &str, source: &str, dependency_name: &str, reex
             oracle_stdout = Some(result.stdout);
         }
     }
+}
+
+fn add_metadata(command: &mut Command, name: &str, library: &std::path::Path) {
+    // Recent nightly Cargo separates metadata from rlibs; rustc accepts both
+    // paths under the same extern name. Older embedded-metadata builds work too.
+    let metadata = library.with_extension("rmeta");
+    if metadata.exists() {
+        command
+            .arg("--extern")
+            .arg(format!("{name}={}", metadata.display()));
+    }
+}
+
+// Cargo's nightly artifact layout places each unit in build/<package>/<hash>/out;
+// older Cargo uses deps/. Match compiler and feature fingerprints so switching
+// backends cannot accidentally test a cached library from the other mode.
+fn cargo_artifacts(executable: &std::path::Path) -> (PathBuf, Vec<PathBuf>) {
+    let profile = executable
+        .ancestors()
+        .find(|path| path.join("deps").is_dir())
+        .unwrap();
+    let hash = executable
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .rsplit('-')
+        .next()
+        .unwrap();
+    let unit = executable.parent().unwrap().parent().unwrap();
+    let test_fingerprint = if unit.join("fingerprint").is_dir() {
+        unit.join("fingerprint/test-integration-test-formatting.json")
+    } else {
+        profile.join(format!(
+            ".fingerprint/introspect-fmt-{hash}/test-integration-test-formatting.json"
+        ))
+    };
+    let expected = fs::read_to_string(test_fingerprint).expect("test fingerprint");
+    // The prefix contains rustc, enabled features, and declared features.
+    let key = expected.split(",\"target\":").next().unwrap();
+    let mut dependencies = vec![profile.join("deps")];
+    let mut candidates = Vec::new();
+    if let Ok(packages) = fs::read_dir(profile.join("build")) {
+        for package in packages.flatten() {
+            if let Ok(units) = fs::read_dir(package.path()) {
+                for unit in units.flatten() {
+                    let out = unit.path().join("out");
+                    if out.is_dir() {
+                        dependencies.push(out.clone());
+                        candidates
+                            .push((out, unit.path().join("fingerprint/lib-introspect_fmt.json")));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(fingerprints) = fs::read_dir(profile.join(".fingerprint")) {
+        for fingerprint in fingerprints.flatten() {
+            candidates.push((
+                profile.join("deps"),
+                fingerprint.path().join("lib-introspect_fmt.json"),
+            ));
+        }
+    }
+    let library = candidates
+        .into_iter()
+        .filter_map(|(out, fingerprint)| {
+            let actual = fs::read_to_string(&fingerprint).ok()?;
+            if actual.split(",\"target\":").next()? != key {
+                return None;
+            }
+            let hash = fingerprint.parent()?.file_name()?.to_str()?;
+            let hash = if hash == "fingerprint" {
+                fingerprint.parent()?.parent()?.file_name()?.to_str()?
+            } else {
+                hash.rsplit('-').next()?
+            };
+            let library = out.join(format!("libintrospect_fmt-{hash}.rlib"));
+            library.exists().then_some(library)
+        })
+        .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
+        .expect("Cargo-built introspect_fmt library with matching compiler and features");
+    (library, dependencies)
 }

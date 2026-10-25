@@ -45,8 +45,10 @@ inspect_format!(|view| {
   borrowing expression temporaries.
 - Explicit arguments are evaluated once and only *borrowed*, not moved.
   `&mut T` argument expressions are evaluated once and captured by shared
-  borrows of the resulting mutable reference. No unsafe casts are needed
-  for primitives.
+  borrows of the resulting mutable reference. One match scrutinee borrows all
+  operands in source order, keeping temporary owners alive through the callback,
+  including receivers of methods returning borrowed values. No unsafe casts are
+  needed for primitives.
 - Each argument has a source expression, optional name, **original type name**,
   and a `Value<'_>` holding direct borrowed primitive values, or `Opaque`.
 - `Value::Opaque` holds an `OpaqueValue<'_>` (`Opaque` remains an alias).
@@ -61,22 +63,31 @@ inspect_format!(|view| {
 - Format strings with implicit captures (`"{name}"`, `"{x:>width$}"`) are
   scanned to expose the captured variables. This scanner is best-effort and
   does not validate the Rust format grammar.
-- `Format::render()` rebuilds the message from its template, primitive values,
-  and opaque Display/Debug hooks. It never reads the retained formatter. It
-  supports basic argument selection and escaping, default Display/Debug, and
-  primitive radix/scientific formats. Unsupported options return `RenderError`
-  rather than silently producing different output. Fixed per-value formats
-  reuse Rust's primitive formatters; the complete message is never delegated.
-- `fmt::Arguments` is retained for direct literal templates, including implicit
+- Each `FormatArg` additionally holds optional hooks for the original value's
+  requested formatting traits, including primitives and references. A shared
+  borrowed reference slot preserves DST metadata and original Pointer dispatch.
+  Repeated placeholders reuse these hooks with different options; unused traits
+  introduce no bounds. Hook capture allocates nothing and never formats eagerly.
+- `Format::render()` independently handles literals, escaping, argument selection,
+  and positional/named/star counts. It never reads the retained formatter.
+  With the opt-in `nightly` feature, `formatting_options` constructs a real
+  `Formatter` per placeholder and calls the original trait implementation,
+  writing directly into the output buffer. Without it, stable format calls cover
+  default traits, common Debug flags, and ordinary width/precision/alignment;
+  a small primitive fallback handles additional options. Unsupported combinations
+  return `RenderError`; the complete message is never delegated.
+- `fmt::Arguments` is retained for analyzed literal templates, including implicit
   captures and dynamic counts. Implicit captures become explicit named operands;
   count operands remain `usize`, while a borrowed wrapper forwards the original
   value's formatting trait implementations and formatter options.
-- Nonliteral templates, including nested macros such as `concat!`, retain the
-  `None` fallback for the retained formatter. The independent renderer can
-  still reconstruct explicit primitives from their runtime template, but custom
-  values lack hooks because the proc macro cannot inspect that expansion.
-  Template expressions are evaluated once, before explicit arguments;
-  only inert direct literals also appear in the generated `format_args!`.
+- With `nightly`, `proc_macro_expand` expands template macros such as `concat!`,
+  `include_str!`, and user macros into literals before analysis. The expanded
+  literal is reused for code generation, preserving custom hooks, trait selection,
+  and count inference without expanding the template twice.
+- Without `nightly`, macro-generated templates retain no `fmt::Arguments` or
+  custom hooks; the renderer can still reconstruct explicit primitives. Runtime
+  template expressions keep this behavior in both modes and are evaluated once,
+  before explicit arguments. Only analyzed literals reach `format_args!`.
 
 ## Compatibility contract and caveats
 
@@ -91,28 +102,51 @@ are not required to receive compiler-identical diagnostics.
 
 1. The callback syntax adds one leading argument:
    `inspect_format!(|view| { ... }, "...", args...)`.
-2. Retaining `fmt::Arguments` depends on recognizing a direct literal template.
+2. Retaining `fmt::Arguments` depends on recognizing a literal template, either
+   directly or through nightly macro expansion.
    Literal reconstruction forwards formatting to the original value type,
    including its `Pointer` implementation; it does not add a reference layer
    to trait dispatch.
-3. For format strings created with macros, implicit captures cannot be
+3. Without `nightly`, implicit captures in macro-generated templates cannot be
    discovered by the separate parser; explicit arguments are still captured.
 4. Literal templates infer detected dynamic count operands as `usize`, including
-   unsuffixed literals. Macro-generated templates cannot be scanned, so those
-   counts may instead be recorded as `i32`.
+   unsuffixed literals. Without `nightly`, macro-generated templates cannot be
+   scanned, so those counts may instead be recorded as `i32`.
 5. Parsing of placeholders is best-effort rather than a full compiler parser.
    Names accept identifiers and keywords; raw identifier labels are normalized
    to the same format name, and keyword captures retain the Rust spelling
    needed to borrow their source variables.
 6. `OpaqueValue` exposes an address and size for *diagnostic purposes only*;
    these do not enable safe downcasting. Its Display/Debug hooks exist only for
-   traits requested in a scanned literal template. Other formatting traits and
-   macro-generated templates have no hooks. Each hook call allocates a string
-   and invokes user formatting code; it does not cache output or retain flags.
-7. An explicit argument is bound as `&(expression)` to preserve non-moving
-   behavior. Context-sensitive lifetime and inference differences from the
-   compiler builtin remain possible and must be tested before claiming full
-   `format_args!` compatibility.
+   traits requested in a scanned literal template. These introspection methods
+   allocate default-formatted strings on demand. Reconstruction separately uses
+   the per-argument hooks for all nine formatting traits, without caching output.
+   Macro-generated templates acquire hooks only with `nightly`.
+7. Explicit arguments are borrowed as `&(expression)` in one match scrutinee
+   to preserve non-moving behavior and statement-scoped temporary lifetimes.
+   Context-sensitive lifetime and inference differences from the compiler builtin
+   remain possible and must be tested before claiming full `format_args!`
+   compatibility.
+8. The nightly `FormattingOptions` API currently accepts `u16` width/precision.
+   Larger counts return an explicit reconstruction error rather than truncating.
+   The nightly toolchain and APIs are pinned through the Fenix flake input.
+
+## Features
+
+No features are enabled by default, so ordinary consumers can use stable Rust.
+Enable exact runtime formatter options and template macro expansion with a
+nightly compiler:
+
+```toml
+# The feature is on the runtime crate; downstream callers need no feature attributes.
+introspect-fmt = { path = "introspect-fmt", features = ["nightly"] }
+```
+
+The feature gates runtime Formatter construction and proc-macro template
+expansion. After expansion, capture, primitive introspection, trait selection,
+and count resolution use the same implementation as direct literals.
+The default flake shell supplies Fenix nightly; `nix develop .#stable` supplies
+Fenix stable for checking that the fallback has no unstable API dependency.
 
 ## Tests
 
@@ -122,54 +156,58 @@ Every output assertion compares against Rust's `format_args!` oracle, after
 constructing a view with its retained formatter set to `None`. It calls the
 actual `Format::render()` implementation, rather than a test-only renderer.
 
-The `unsupported` module contains intentionally failing tests. They assert
-successful compilation and exact output, just like supported cases. They are
-neither ignored nor marked `should_panic`; errors and mismatches stay red until
-the feature works. Cases rejected by the prototype's macro are compiled in
+The same tests run in both feature modes. The `nightly_required` module asserts
+exact output and passes with `--features nightly`; it deliberately fails without
+that feature. These assertions use neither `cfg` to hide tests, `ignore`,
+`should_panic`, nor expected errors as success. Cases rejected by the prototype's
+macro are compiled in
 subprocesses so they do not prevent the other tests from running. The harness
 first compiles/runs the Rust oracle, then the prototype, and compares output.
 Alias and facade fixtures also exercise implicit/keyword captures, custom trait
 hooks, mutable borrows, single evaluation, and calls through another wrapper.
 An internal runtime test checks `$crate` resolution within its defining crate.
 
-| Area | Current independent reconstruction |
-| --- | --- |
-| Literals, escapes, basic primitives, names, positions, repeats | Supported |
-| Primitive radix/scientific formats and hex Debug | Supported |
-| Default custom Display/Debug, dual traits, mutable references | Supported |
-| Macro-generated templates with explicit primitives | Supported |
-| Width, fill, alignment, signs, prefixes, zero padding, precision | Failing tests |
-| Dynamic counts and star-precision indexing | Failing tests |
-| Custom formatter flags and non-Display/Debug hooks | Failing tests |
-| Pointer output | Failing tests |
-| Custom hooks with macro-generated or forwarded literals | Failing tests |
-| Keyword argument names, raw identifier names, and receiver captures | Supported |
-| Renamed dependencies and facade re-exports | Supported |
+| Area | Default / stable | `nightly` feature |
+| --- | --- | --- |
+| Literals, escapes, basic primitives, names, positions, repeats | Supported | Supported |
+| Primitive radix/scientific formats and hex Debug | Supported | Supported |
+| Custom trait-only types, mutable references, dual traits | Supported | Supported |
+| Dynamic counts and star-precision indexing | Supported | Supported |
+| Primitive width, Unicode fill, alignment, zero padding | Supported | Supported |
+| Custom width/precision with space fill, common Debug flags | Supported | Supported |
+| Arbitrary custom fill, signs, flags, and count combinations | Best effort; failing tests | Supported within count limits |
+| Original Pointer output | Supported | Supported |
+| Forwarded literals, keyword names, renamed crates, re-exports | Supported | Supported |
+| Macro-generated templates with explicit primitives | Best effort | Supported |
+| Custom hooks and counts with macro-generated templates | Failing tests | Supported |
 
 [introspection.rs](introspect-fmt/tests/introspection.rs) separately consolidates
 primitive specialization, metadata, source order, count inference, hook laziness,
 and borrowing. Nonliteral expressions and unsized values accepted as prototype
 extensions are kept here, separate from valid Rust formatting syntax.
 
-Run the entire matrix, including known failures and metadata tests:
+Run the entire matrix, including intentionally red gaps, in both modes:
 
 ```sh
-cargo test --workspace --locked --no-fail-fast
+nix develop -c cargo test --workspace --locked --features nightly --no-fail-fast
+nix develop .#stable -c cargo test --workspace --locked --no-fail-fast
 ```
 
-A supported-only smoke check is available separately; it does not establish
-full compatibility:
+The nightly run should pass; the default/stable run should fail only
+`nightly_required::`. These are parity assertions, not tests expecting errors.
+The adversarial cases cover brace fill, borrows into temporary receivers, and
+temporary drop timing. Rerun them with
+`cargo test --features nightly --test formatting adversarial`.
+A smoke check excluding the known stable gaps is available separately; it does
+not establish full compatibility:
 
 ```sh
-cargo test --workspace --locked -- --skip unsupported::
+nix develop .#stable -c cargo test --workspace --locked -- --skip nightly_required::
 ```
 
-The Nix flake supplies Cargo, Rust, rustfmt, Clippy, and rust-analyzer. Run the
-full matrix inside the pinned environment with:
-
-```sh
-nix develop -c cargo test --workspace --locked --no-fail-fast
-```
+The flake lock pins Fenix, Cargo, Rust, rustfmt, Clippy, rust-analyzer, and matching
+standard-library sources. Compiler fixtures match the active compiler/features
+and support both traditional Cargo artifacts and nightly's separate metadata.
 
 The cases follow the [standard library formatting documentation](https://doc.rust-lang.org/std/fmt/).
 Add a focused parity test whenever a new usage pattern is found; a passing

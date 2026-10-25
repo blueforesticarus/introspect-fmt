@@ -4,5 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Opt in to unstable Formatter construction and template macro expansion.
+default = []
+nightly = ["introspect-fmt-macros/nightly"]
+
 [dependencies]
 introspect-fmt-macros = { path = "../introspect-fmt-macros" }

@@ -1,6 +1,8 @@
 //! Syntax-directed prototype, leaving Rust's built-in formatter in charge of
 //! validating/rendering only when doing so cannot alter argument capture.
 
+#![cfg_attr(feature = "nightly", feature(proc_macro_expand))]
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -71,9 +73,25 @@ enum ArgumentKey {
     Name(String),
 }
 #[derive(Default)]
-struct RequiredTraits {
-    display: bool,
-    debug: bool,
+struct RequiredTraits(u16);
+
+impl RequiredTraits {
+    // Keep trait bits aligned with the runtime's Kind order. Count-only inputs
+    // have no bits and therefore acquire no formatting trait bounds.
+    fn from_spec(spec: &str) -> Self {
+        Self(match spec {
+            "" => 1,
+            "?" | "x?" | "X?" => 2,
+            "b" => 4,
+            "o" => 8,
+            "x" => 16,
+            "X" => 32,
+            "e" => 64,
+            "E" => 128,
+            "p" => 256,
+            _ => 0,
+        })
+    }
 }
 
 // Parse trait selection and count operands together, after skipping fill and
@@ -134,10 +152,7 @@ fn analyze_spec(spec: &str) -> SpecInfo {
             spec = skip_count(precision, &mut info.counts);
         }
     }
-    info.traits = RequiredTraits {
-        display: spec.is_empty(),
-        debug: matches!(spec, "?" | "x?" | "X?"),
-    };
+    info.traits = RequiredTraits::from_spec(spec);
     info
 }
 
@@ -169,8 +184,14 @@ fn analyze_format(fmt: &str) -> FormatInfo {
         }
         let mut inside = String::new();
         let mut done = false;
-        for (_, c) in chars.by_ref() {
-            if c == '}' {
+        while let Some((_, c)) = chars.next() {
+            // Only the first specifier character can be a closing-brace fill.
+            // Keep this boundary rule in sync with the runtime field scanner.
+            let brace_fill = inside.ends_with(':')
+                && chars
+                    .peek()
+                    .is_some_and(|(_, next)| matches!(next, '<' | '^' | '>'));
+            if c == '}' && !brace_fill {
                 done = true;
                 break;
             }
@@ -204,8 +225,7 @@ fn analyze_format(fmt: &str) -> FormatInfo {
         };
         if let Some(key) = key {
             let entry = info.traits.entry(key).or_default();
-            entry.display |= spec.traits.display;
-            entry.debug |= spec.traits.debug;
+            entry.0 |= spec.traits.0;
         }
 
         // Dynamic counts are exact usize operands. Identifiers are kept whole,
@@ -249,16 +269,63 @@ fn captured_value(
     required: Option<&RequiredTraits>,
 ) -> TokenStream2 {
     let display = required
-        .filter(|traits| traits.display)
+        .filter(|traits| traits.0 & 1 != 0)
         .map(|_| quote! { .display() });
     let debug = required
-        .filter(|traits| traits.debug)
+        .filter(|traits| traits.0 & 2 != 0)
         .map(|_| quote! { .debug() });
     quote! {
         #runtime::__private::Formatters::new(&#temp)
             #display #debug
             .attach(#runtime::__private::Probe::new(#temp).__introspect_fmt_capture())
     }
+}
+
+// Capture requested traits for every original type, including normalized
+// primitives and references. These hooks work on stable and nightly alike.
+fn trait_formatters(
+    runtime: &TokenStream2,
+    temp: &Ident,
+    required: Option<&RequiredTraits>,
+) -> TokenStream2 {
+    let bits = required.map_or(0, |traits| traits.0);
+    let methods = [
+        "display",
+        "debug",
+        "binary",
+        "octal",
+        "lower_hex",
+        "upper_hex",
+        "lower_exp",
+        "upper_exp",
+        "pointer",
+    ];
+    let methods = methods
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| bits & (1 << index) != 0)
+        .map(|(_, name)| format_ident!("{}", name));
+    quote! { #runtime::__private::TraitFormatters::new(&#temp) #(.#methods())* .finish() }
+}
+
+#[cfg(feature = "nightly")]
+fn expand_template(format: Expr) -> Result<Expr> {
+    let mut analyzed = &format;
+    while let Expr::Group(group) = analyzed {
+        analyzed = &group.expr;
+    }
+    // Only request expansion for template macros. Runtime expressions are an
+    // introspection extension and must keep their evaluation order and effects.
+    if !matches!(analyzed, Expr::Macro(_)) {
+        return Ok(format);
+    }
+    let tokens: TokenStream = quote!(#format).into();
+    let expanded = tokens.expand_expr().map_err(|error| {
+        syn::Error::new_spanned(&format, format!("cannot expand format template: {error:?}"))
+    })?;
+    // Use the result for both analysis and generated code: expanding the source
+    // again could repeat procedural-macro effects or read a different literal.
+    syn::parse(expanded)
 }
 
 #[proc_macro]
@@ -269,13 +336,26 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         format,
         args,
     } = parse_macro_input!(tokens as Invocation);
-    let (literal, capture_span) = match &format {
+    #[cfg(feature = "nightly")]
+    let format = match expand_template(format) {
+        Ok(format) => format,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    // Forwarded macro_rules! literals arrive inside invisible expression groups.
+    // Keep the original expression for generated code, peeling only for analysis.
+    let mut analyzed_format = &format;
+    while let Expr::Group(group) = analyzed_format {
+        analyzed_format = &group.expr;
+    }
+    let (literal, capture_span) = match analyzed_format {
         Expr::Lit(ExprLit {
             lit: Lit::Str(s), ..
         }) => (Some(s.value()), s.span()),
         _ => (None, Span::call_site()),
     };
     let info = literal.as_ref().map(|text| analyze_format(text));
+    let mut operands = Vec::new();
+    let mut bindings = Vec::new();
     let mut bound = Vec::new();
     let mut descriptors = Vec::new();
     let mut fmt_args = Vec::new();
@@ -302,17 +382,20 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             let named =
                 name.and_then(|name| info.traits.get(&ArgumentKey::Name(argument_name(name))));
             for traits in positional.into_iter().chain(named) {
-                required.display |= traits.display;
-                required.debug |= traits.debug;
+                required.0 |= traits.0;
             }
             is_count = info.count_positions.contains(&i)
                 || name.is_some_and(|name| info.count_names.contains(&argument_name(name)));
         }
         let captured = captured_value(&runtime, &temp, Some(&required));
+        let formatting = trait_formatters(&runtime, &temp, Some(&required));
+        // One scrutinee keeps every operand's temporary owners alive through
+        // the callback, including owners hidden behind method/function calls.
+        operands.push(quote! { &(#expr) });
+        bindings.push(temp.clone());
         if is_count {
-            bound.push(quote! { let #temp: &usize = &(#expr); });
-        } else {
-            bound.push(quote! { let #temp = &(#expr); });
+            // Constrain the already borrowed operand without evaluating it again.
+            bound.push(quote! { let #temp: &usize = #temp; });
         }
         let text = LitStr::new(&quote!(#expr).to_string(), Span::call_site());
         let label = match name {
@@ -327,7 +410,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
                 #label, #text,
                 #runtime::__private::rust_type_name(#temp),
                 #captured
-            )
+            ).with_formatting(#formatting)
         });
         // Counts stay usize operands; values use explicit trait forwarding to
         // preserve their original impls, pointer addresses, and DST support.
@@ -380,19 +463,23 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
                 &temp,
                 info.traits.get(&ArgumentKey::Name(name.clone())),
             );
+            let formatting = trait_formatters(
+                &runtime,
+                &temp,
+                info.traits.get(&ArgumentKey::Name(name.clone())),
+            );
             descriptors.push(quote! {
                 #runtime::FormatArg::new(
                     Some(#label), #label,
                     #runtime::__private::rust_type_name(#temp),
                     #captured
-                )
+                ).with_formatting(#formatting)
             });
         }
     }
 
-    // Only a direct literal can be analyzed before expansion. Dollar signs,
-    // escaped braces, implicit captures, and dynamic counts are all handled by
-    // Rust's builtin now that operands retain their original types.
+    // Analyze direct and nightly-expanded literals. Rust's builtin validates
+    // dollar signs, escapes, captures, and counts with the original operand types.
     let rendered = if literal.is_some() {
         let args = fmt_args;
         quote! { Some(::std::format_args!(#format #(, #args)*)) }
@@ -403,15 +490,21 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     let expanded = quote! {{
         use #runtime::__private::Capture as _;
         // Nonliteral templates are evaluated here exactly once; only inert
-        // direct literals are also passed to the compiler's format_args!.
+        // literals (including nightly-expanded ones) also reach format_args!.
         let __introspect_fmt_template: &'static str = #format;
-        #(#bound)*
-        let __introspect_fmt_values = [#(#descriptors),*];
-        #runtime::__private::invoke(#runtime::Format::new(
-            __introspect_fmt_template,
-            &__introspect_fmt_values,
-            #rendered,
-        ), #callback)
+        // Separate let initializers would drop temporary receivers too early.
+        // Match preserves source-order evaluation and borrows without moving.
+        match (#(#operands,)*) {
+            (#(#bindings,)*) => {
+                #(#bound)*
+                let __introspect_fmt_values = [#(#descriptors),*];
+                #runtime::__private::invoke(#runtime::Format::new(
+                    __introspect_fmt_template,
+                    &__introspect_fmt_values,
+                    #rendered,
+                ), #callback)
+            }
+        }
     }};
     expanded.into()
 }
