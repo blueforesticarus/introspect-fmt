@@ -2,7 +2,10 @@
 //! Format one value at a time; never delegate the full message to Rust's
 //! formatter or read the optional retained formatting arguments.
 
-use crate::{FormatArg, Value};
+use crate::{
+    spec::{Kind, Spec},
+    FormatArg, Value,
+};
 use std::fmt;
 
 /// Information the prototype cannot currently reconstruct.
@@ -24,78 +27,58 @@ impl fmt::Display for RenderError {
                 write!(formatter, "unsupported format specifier {spec:?}")
             }
             Self::MissingFormatter(name) => write!(formatter, "opaque value has no {name} hook"),
-            Self::FormattingFailed => formatter.write_str("argument formatter returned fmt::Error"),
+            Self::FormattingFailed => {
+                formatter.write_str("writer or argument formatter returned fmt::Error")
+            }
         }
     }
 }
 impl std::error::Error for RenderError {}
 
+fn formatting<'a>(argument: &'a FormatArg<'_>) -> Option<&'a crate::formatting::Formatting<'a>> {
+    argument.formatting.or_else(|| match argument.value() {
+        Value::Opaque(value) => value.formatting,
+        _ => None,
+    })
+}
+
 // This interface deliberately cannot access Format's retained formatter.
-// Fail explicitly when options cannot be reproduced; never silently drop them.
-pub(crate) fn render(template: &str, arguments: &[FormatArg<'_>]) -> Result<String, RenderError> {
-    let mut output = String::new();
-    let mut chars = template.chars().peekable();
-    let mut next = 0usize;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' if chars.peek() == Some(&'{') => {
-                chars.next();
-                output.push('{');
+// Stream the same literal/placeholder traversal used by owned recipe capture.
+pub(crate) fn render_to(
+    template: &str,
+    arguments: &[FormatArg<'_>],
+    output: &mut dyn fmt::Write,
+) -> Result<(), RenderError> {
+    let mut next = 0;
+    for piece in crate::template::pieces(template) {
+        match piece? {
+            crate::template::Piece::Literal(text) => output
+                .write_str(text)
+                .map_err(|_| RenderError::FormattingFailed)?,
+            crate::template::Piece::Argument { key, spec } => {
+                let spec = Spec::parse(spec, arguments, &mut next)?;
+                let index = crate::spec::argument_index(key, arguments, &mut next)?;
+                render_argument(&arguments[index], &spec, output)?;
             }
-            '}' if chars.peek() == Some(&'}') => {
-                chars.next();
-                output.push('}');
-            }
-            '{' => {
-                let mut field = String::new();
-                loop {
-                    match chars.next() {
-                        // Immediately after ':', a brace followed by alignment
-                        // is fill. Match the proc-macro's field boundary rule.
-                        Some('}')
-                            if !(field.ends_with(':')
-                                && chars
-                                    .peek()
-                                    .is_some_and(|next| matches!(next, '<' | '^' | '>'))) =>
-                        {
-                            break;
-                        }
-                        Some(ch) => field.push(ch),
-                        None => return Err(RenderError::InvalidTemplate),
-                    }
-                }
-                let (head, spec) = field.split_once(':').unwrap_or((&field, ""));
-                // Star precision consumes its count before the implicit value.
-                // The same parser/count semantics feed both feature modes.
-                let spec = crate::spec::Spec::parse(spec, arguments, &mut next)?;
-                let head = head.trim();
-                let argument = if head.is_empty() {
-                    let index = next;
-                    next += 1;
-                    arguments.get(index)
-                } else if let Ok(index) = head.parse::<usize>() {
-                    arguments.get(index)
-                } else {
-                    arguments
-                        .iter()
-                        .find(|argument| argument.name() == Some(head))
-                }
-                .ok_or_else(|| RenderError::MissingArgument(head.to_owned()))?;
-                let rendered = match &argument.formatting {
-                    Some(formatting) => formatting.render(&spec, &mut output)?,
-                    None => false,
-                };
-                if !rendered {
-                    // Macro-generated templates may have no captured hooks.
-                    // Retain the small primitive fallback in either feature mode.
-                    output.push_str(&render_value(argument.value(), &spec.literal())?);
-                }
-            }
-            '}' => return Err(RenderError::InvalidTemplate),
-            ch => output.push(ch),
         }
     }
-    Ok(output)
+    Ok(())
+}
+
+// Shared by borrowed rendering and owned capture so custom trait options agree.
+pub(crate) fn render_argument(
+    argument: &FormatArg<'_>,
+    spec: &Spec,
+    output: &mut dyn fmt::Write,
+) -> Result<(), RenderError> {
+    if !formatting(argument)
+        .map(|f| f.render(spec, output))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        render_value(argument.value(), spec, output)?;
+    }
+    Ok(())
 }
 
 // Fixed per-value formats reuse Rust's primitive implementations. The message's
@@ -149,9 +132,10 @@ where
 fn float<T: fmt::Display + fmt::Debug + fmt::LowerExp + fmt::UpperExp>(
     value: &T,
     spec: &str,
+    precision: Option<usize>,
 ) -> Result<String, RenderError> {
     // Rust handles rounding before rendering, including ties and special values.
-    if let Some(precision) = literal_precision(spec) {
+    if let Some(precision) = precision {
         return Ok(format!("{value:.precision$}"));
     }
     match spec {
@@ -163,65 +147,39 @@ fn float<T: fmt::Display + fmt::Debug + fmt::LowerExp + fmt::UpperExp>(
     }
 }
 
-// Only a complete literal precision is supported here; flags stay explicit errors.
-fn literal_precision(spec: &str) -> Option<usize> {
-    let digits = spec.strip_prefix('.')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-// Separate padding from primitive rendering so Unicode fill stays independent
-// of numeric signs, prefixes, and Rust's precision/rounding implementations.
-fn render_value(value: &Value<'_>, spec: &str) -> Result<String, RenderError> {
+// Strip only padding options for the primitive fallback, using the shared
+// parsed spec rather than maintaining a second format grammar here.
+fn fallback_text(value: &Value<'_>, spec: &Spec) -> Result<String, RenderError> {
+    // Preserve opaque error details instead of stripping unsupported options.
     if matches!(value, Value::Opaque(_)) {
         return render_unpadded(value, spec);
     }
-    let unsupported = || RenderError::UnsupportedSpecifier(spec.to_owned());
-    let mut rest = spec;
-    let mut fill = ' ';
-    let mut alignment = None;
-    let mut chars = rest.chars();
-    let first = chars.next();
-    let second = chars.next();
-    if second.is_some_and(|ch| matches!(ch, '<' | '^' | '>')) {
-        fill = first.unwrap();
-        alignment = second;
-        rest = &rest[fill.len_utf8() + 1..];
-    } else if first.is_some_and(|ch| matches!(ch, '<' | '^' | '>')) {
-        alignment = first;
-        rest = &rest[1..];
+    if matches!(spec.kind, Kind::Debug)
+        && (spec.width.unwrap_or(0) != 0 || spec.align.is_some() || spec.zero)
+    {
+        return Err(RenderError::UnsupportedSpecifier(spec.literal()));
     }
-    let flag_end = rest
-        .char_indices()
-        .find(|(_, ch)| !matches!(ch, '+' | '-' | '#'))
-        .map_or(rest.len(), |(index, _)| index);
-    let flags = &rest[..flag_end];
-    rest = &rest[flag_end..];
-    let zero = rest.starts_with('0');
-    if zero {
-        rest = &rest[1..];
-    }
-    let width_end = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let width = if width_end == 0 {
-        0
-    } else {
-        rest[..width_end]
-            .parse::<usize>()
-            .map_err(|_| unsupported())?
+    let core = Spec {
+        fill: ' ',
+        align: None,
+        zero: false,
+        width: None,
+        ..*spec
     };
-    rest = &rest[width_end..];
-    let core = format!("{flags}{rest}");
+    render_unpadded(value, &core)
+}
+
+// Stream padding separately; only the best-effort stable primitive fallback
+// allocates a per-value string. Captured hooks stream their original trait call.
+fn render_value(
+    value: &Value<'_>,
+    spec: &Spec,
+    output: &mut dyn fmt::Write,
+) -> Result<(), RenderError> {
+    let text = fallback_text(value, spec)?;
     let numeric = !matches!(value, Value::Bool(_) | Value::Char(_) | Value::Str(_));
-    // Debug implementations have type-specific padding semantics. Leave these
-    // explicit errors until options can be passed to their original formatter.
-    if rest.ends_with('?') && (width != 0 || alignment.is_some() || zero) {
-        return Err(unsupported());
-    }
-    let text = render_unpadded(value, &core)?;
-    let padding = width.saturating_sub(text.chars().count());
-    if zero && numeric {
+    let padding = spec.width.unwrap_or(0).saturating_sub(text.chars().count());
+    if spec.zero && numeric {
         // Sign-aware zero padding overrides alignment and follows radix prefixes.
         let sign = usize::from(text.starts_with(['+', '-']));
         let prefix = if ["0x", "0o", "0b"]
@@ -233,30 +191,53 @@ fn render_value(value: &Value<'_>, spec: &str) -> Result<String, RenderError> {
             0
         };
         let split = sign + prefix;
-        return Ok(format!(
-            "{}{}{}",
-            &text[..split],
-            "0".repeat(padding),
-            &text[split..]
-        ));
+        output
+            .write_str(&text[..split])
+            .map_err(|_| RenderError::FormattingFailed)?;
+        pad(output, '0', padding)?;
+        return output
+            .write_str(&text[split..])
+            .map_err(|_| RenderError::FormattingFailed);
     }
-    let alignment = alignment.unwrap_or(if numeric { '>' } else { '<' });
+    let alignment = spec.align.unwrap_or(if numeric { '>' } else { '<' });
     let left = match alignment {
         '>' => padding,
         '^' => padding / 2,
         _ => 0,
     };
-    let pad = |count| std::iter::repeat_n(fill, count).collect::<String>();
-    Ok(format!("{}{text}{}", pad(left), pad(padding - left)))
+    pad(output, spec.fill, left)?;
+    output
+        .write_str(&text)
+        .map_err(|_| RenderError::FormattingFailed)?;
+    pad(output, spec.fill, padding - left)
 }
 
-fn render_unpadded(value: &Value<'_>, spec: &str) -> Result<String, RenderError> {
+// Avoid both a padding allocation and newer std::iter::repeat_n requirements.
+fn pad(output: &mut dyn fmt::Write, fill: char, count: usize) -> Result<(), RenderError> {
+    for _ in 0..count {
+        output
+            .write_char(fill)
+            .map_err(|_| RenderError::FormattingFailed)?;
+    }
+    Ok(())
+}
+
+fn render_unpadded(value: &Value<'_>, parsed: &Spec) -> Result<String, RenderError> {
+    let literal = parsed.literal();
+    let spec = literal.as_str();
+    // Precision-only support remains intentionally narrow on the stable path.
+    let precision =
+        if parsed.sign.is_none() && !parsed.alternate && matches!(parsed.kind, Kind::Display) {
+            parsed.precision
+        } else {
+            None
+        };
     match value {
         Value::Bool(value) => basic(value, spec),
         Value::Char(value) => basic(value, spec),
         Value::Str(value) => {
             // String precision counts Unicode scalar values rather than bytes.
-            if let Some(precision) = literal_precision(spec) {
+            if let Some(precision) = precision {
                 Ok(format!("{value:.precision$}"))
             } else {
                 basic(value, spec)
@@ -274,14 +255,13 @@ fn render_unpadded(value: &Value<'_>, spec: &str) -> Result<String, RenderError>
         Value::U64(value) => integer(value, spec),
         Value::U128(value) => integer(value, spec),
         Value::Usize(value) => integer(value, spec),
-        Value::F32(value) => float(value, spec),
-        Value::F64(value) => float(value, spec),
-        Value::Opaque(value) => match spec {
-            "" => value
-                .display()
-                .ok_or(RenderError::MissingFormatter("Display")),
-            "?" => value.debug().ok_or(RenderError::MissingFormatter("Debug")),
-            _ => Err(RenderError::UnsupportedSpecifier(spec.to_owned())),
-        },
+        Value::F32(value) => float(value, spec, precision),
+        Value::F64(value) => float(value, spec, precision),
+        // Opaque values always use the shared hook table above.
+        Value::Opaque(_) => Err(match spec {
+            "" => RenderError::MissingFormatter("Display"),
+            "?" => RenderError::MissingFormatter("Debug"),
+            _ => RenderError::UnsupportedSpecifier(spec.to_owned()),
+        }),
     }
 }

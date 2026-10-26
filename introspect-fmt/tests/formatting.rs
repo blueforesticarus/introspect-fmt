@@ -199,6 +199,16 @@ fn renamed_dependency_compiles() {
 }
 
 #[test]
+fn no_std_caller_with_std_enabled_runtime_compiles() {
+    // A dependency can be no_std while feature unification enables the runtime.
+    support::assert_compiles_and_renders(
+        "no_std_caller",
+        include_str!("fixtures/no_std_caller.rs"),
+        "introspect_fmt",
+    );
+}
+
+#[test]
 fn reexported_macro_without_direct_runtime_dependency() {
     support::assert_reexported_compiles_and_renders(
         "reexported",

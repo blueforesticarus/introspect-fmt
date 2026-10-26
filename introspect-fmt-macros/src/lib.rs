@@ -8,6 +8,7 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
 use syn::{
+    bracketed,
     ext::IdentExt,
     parenthesized,
     parse::{Parse, ParseStream, Parser},
@@ -23,6 +24,7 @@ struct Invocation {
     callback: ExprClosure,
     format: Expr,
     args: Vec<InputArg>,
+    expressions: Vec<LitStr>,
 }
 impl Parse for Invocation {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
@@ -31,6 +33,23 @@ impl Parse for Invocation {
         let runtime_group;
         parenthesized!(runtime_group in input);
         let runtime = runtime_group.parse()?;
+        // A facade may pre-borrow operands to preserve caller control flow.
+        // Let that hidden bridge retain the original source-expression labels.
+        let expressions = if input.peek(Token![@]) {
+            input.parse::<Token![@]>()?;
+            let marker: Ident = input.parse()?;
+            if marker != "__expressions" {
+                return Err(syn::Error::new(marker.span(), "expected __expressions"));
+            }
+            let labels;
+            bracketed!(labels in input);
+            labels
+                .parse_terminated(|input| input.parse::<LitStr>(), Token![,])?
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let callback = input.parse::<ExprClosure>()?;
         input.parse::<Token![,]>()?;
         let format = input.parse::<Expr>()?;
@@ -61,6 +80,7 @@ impl Parse for Invocation {
             callback,
             format,
             args,
+            expressions,
         })
     }
 }
@@ -263,24 +283,6 @@ fn argument_name(ident: &Ident) -> String {
     ident.unraw().to_string()
 }
 
-fn captured_value(
-    runtime: &TokenStream2,
-    temp: &Ident,
-    required: Option<&RequiredTraits>,
-) -> TokenStream2 {
-    let display = required
-        .filter(|traits| traits.0 & 1 != 0)
-        .map(|_| quote! { .display() });
-    let debug = required
-        .filter(|traits| traits.0 & 2 != 0)
-        .map(|_| quote! { .debug() });
-    quote! {
-        #runtime::__private::Formatters::new(&#temp)
-            #display #debug
-            .attach(#runtime::__private::Probe::new(#temp).__introspect_fmt_capture())
-    }
-}
-
 // Capture requested traits for every original type, including normalized
 // primitives and references. These hooks work on stable and nightly alike.
 fn trait_formatters(
@@ -335,6 +337,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
         callback,
         format,
         args,
+        expressions,
     } = parse_macro_input!(tokens as Invocation);
     #[cfg(feature = "nightly")]
     let format = match expand_template(format) {
@@ -387,7 +390,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             is_count = info.count_positions.contains(&i)
                 || name.is_some_and(|name| info.count_names.contains(&argument_name(name)));
         }
-        let captured = captured_value(&runtime, &temp, Some(&required));
+        let captured = quote! { #runtime::__private::Probe::new(#temp).__introspect_fmt_capture() };
         let formatting = trait_formatters(&runtime, &temp, Some(&required));
         // One scrutinee keeps every operand's temporary owners alive through
         // the callback, including owners hidden behind method/function calls.
@@ -397,20 +400,27 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             // Constrain the already borrowed operand without evaluating it again.
             bound.push(quote! { let #temp: &usize = #temp; });
         }
-        let text = LitStr::new(&quote!(#expr).to_string(), Span::call_site());
+        let text = expressions
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| LitStr::new(&quote!(#expr).to_string(), Span::call_site()));
         let label = match name {
             Some(name) => {
                 let label = LitStr::new(&argument_name(name), Span::call_site());
-                quote! { Some(#label) }
+                // Facades such as tracing support callers without a prelude.
+                quote! { ::core::option::Option::Some(#label) }
             }
-            None => quote! { None },
+            None => quote! { ::core::option::Option::None },
         };
+        let hooks = format_ident!("__introspect_fmt_hooks_{}", i, span = Span::mixed_site());
+        // Both introspection and reconstruction borrow this one local table.
+        bound.push(quote! { let #hooks = #formatting; });
         descriptors.push(quote! {
             #runtime::FormatArg::new(
                 #label, #text,
                 #runtime::__private::rust_type_name(#temp),
                 #captured
-            ).with_formatting(#formatting)
+            ).with_formatting(&#hooks)
         });
         // Counts stay usize operands; values use explicit trait forwarding to
         // preserve their original impls, pointer addresses, and DST support.
@@ -458,22 +468,25 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             };
             fmt_args.push(quote! { #ident = #fmt_value });
             let label = LitStr::new(name, Span::call_site());
-            let captured = captured_value(
-                &runtime,
-                &temp,
-                info.traits.get(&ArgumentKey::Name(name.clone())),
-            );
+            let captured =
+                quote! { #runtime::__private::Probe::new(#temp).__introspect_fmt_capture() };
             let formatting = trait_formatters(
                 &runtime,
                 &temp,
                 info.traits.get(&ArgumentKey::Name(name.clone())),
             );
+            let hooks = format_ident!(
+                "__introspect_fmt_implicit_hooks_{}",
+                i,
+                span = Span::mixed_site()
+            );
+            bound.push(quote! { let #hooks = #formatting; });
             descriptors.push(quote! {
                 #runtime::FormatArg::new(
-                    Some(#label), #label,
+                    ::core::option::Option::Some(#label), #label,
                     #runtime::__private::rust_type_name(#temp),
                     #captured
-                ).with_formatting(#formatting)
+                ).with_formatting(&#hooks)
             });
         }
     }
@@ -482,9 +495,11 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     // dollar signs, escapes, captures, and counts with the original operand types.
     let rendered = if literal.is_some() {
         let args = fmt_args;
-        quote! { Some(::std::format_args!(#format #(, #args)*)) }
+        // Callers can be no_std crates even when this runtime has std enabled
+        // through feature unification (for example, GPU allocator log macros).
+        quote! { ::core::option::Option::Some(::core::format_args!(#format #(, #args)*)) }
     } else {
-        quote! { None }
+        quote! { ::core::option::Option::None }
     };
 
     let expanded = quote! {{

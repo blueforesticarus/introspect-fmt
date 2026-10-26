@@ -9,9 +9,9 @@
 //! a call involving `&mut T` creates *shared* references to the resulting
 //! `&mut T` value, never a second exclusive borrow.
 
-#![cfg_attr(feature = "nightly", feature(formatting_options))]
+#![cfg_attr(feature = "nightly", feature(formatting_options, min_specialization))]
 
-use std::{any::type_name, fmt, marker::PhantomData};
+use std::{any::type_name, fmt};
 
 /// Capture ordinary formatting inputs without moving their values.
 /// The wrapper supplies its defining crate hygienically, including through
@@ -25,8 +25,11 @@ macro_rules! inspect_format {
 }
 
 mod formatting;
+mod owned;
+pub use owned::{OwnedTemplate, OwnedValue, TemplateArgument, TemplatePiece};
 mod render;
 mod spec;
+mod template;
 pub use render::RenderError;
 
 /// Each argument in its original macro order, followed by any implicitly
@@ -39,7 +42,7 @@ pub struct FormatArg<'a> {
     value: Value<'a>,
     // Preserve original trait dispatch even when Value normalizes a reference
     // into a primitive. In particular, Pointer must see the original type.
-    formatting: Option<formatting::Formatting<'a>>,
+    formatting: Option<&'a formatting::Formatting<'a>>,
 }
 
 impl<'a> FormatArg<'a> {
@@ -60,7 +63,11 @@ impl<'a> FormatArg<'a> {
     }
 
     #[doc(hidden)]
-    pub fn with_formatting(mut self, formatting: formatting::Formatting<'a>) -> Self {
+    pub fn with_formatting(mut self, formatting: &'a formatting::Formatting<'a>) -> Self {
+        // Introspection and reconstruction share the same borrowed dispatch table.
+        if let Value::Opaque(opaque) = &mut self.value {
+            opaque.formatting = Some(formatting);
+        }
         self.formatting = Some(formatting);
         self
     }
@@ -138,12 +145,8 @@ pub struct OpaqueValue<'a> {
     type_name: &'static str,
     address: *const (),
     size: usize,
-    // This points at a borrowed reference slot, preserving even DST metadata.
-    // Only Formatters::attach can pair it with the monomorphized functions.
-    formatting_address: *const (),
-    display: Option<unsafe fn(*const ()) -> String>,
-    debug: Option<unsafe fn(*const ()) -> String>,
-    _lifetime: PhantomData<&'a ()>,
+    // Shared with FormatArg; this table also carries the borrow lifetime.
+    formatting: Option<&'a formatting::Formatting<'a>>,
 }
 impl OpaqueValue<'_> {
     pub fn type_name(&self) -> &'static str {
@@ -158,17 +161,11 @@ impl OpaqueValue<'_> {
     /// Format with default Display options, if requested by a literal template.
     /// Placeholder width, precision, and flags are not retained here.
     pub fn display(&self) -> Option<String> {
-        self.display.map(|format| {
-            // SAFETY: attach pairs this function with its original borrowed T.
-            unsafe { format(self.formatting_address) }
-        })
+        self.formatting?.default(spec::Kind::Display)
     }
     /// Format with default Debug options, if requested by a literal template.
     pub fn debug(&self) -> Option<String> {
-        self.debug.map(|format| {
-            // SAFETY: attach pairs this function with its original borrowed T.
-            unsafe { format(self.formatting_address) }
-        })
+        self.formatting?.default(spec::Kind::Debug)
     }
 }
 
@@ -206,7 +203,16 @@ impl<'a> Format<'a> {
     /// Does not read retained `fmt::Arguments`. Unsupported options return an
     /// error rather than producing a string with different formatting.
     pub fn render(&self) -> Result<String, RenderError> {
-        render::render(self.template, self.arguments)
+        let mut output = String::new();
+        self.render_to(&mut output)?;
+        Ok(output)
+    }
+    /// Reconstruct directly into a writer without allocating a message buffer.
+    /// Errors may leave partial output in the writer. A writer or user formatter
+    /// failure returns `RenderError::FormattingFailed`.
+    /// Like `render`, this never reads retained `fmt::Arguments`.
+    pub fn render_to(&self, output: &mut impl fmt::Write) -> Result<(), RenderError> {
+        render::render_to(self.template, self.arguments, output)
     }
     /// `None` means this prototype deliberately declined to reconstruct
     /// standard formatting, not that any argument was omitted.
@@ -223,7 +229,7 @@ pub mod __private {
 
     // Safe builders are reachable by downstream macro expansions; erased
     // pointers and their monomorphized thunks remain private to the runtime.
-    pub use crate::formatting::Formatters as TraitFormatters;
+    pub use crate::formatting::{Formatters as TraitFormatters, Render};
 
     // Public only because downstream wrapper expansions must reach this entry.
     #[doc(hidden)]
@@ -250,84 +256,19 @@ pub mod __private {
         type_name::<T>()
     }
 
-    // Forward explicitly to T's trait impl rather than the blanket impl for
-    // &T (notably Pointer). This sized wrapper also keeps the prototype's
-    // existing support for borrowed unsized values, without copying or moving.
-    pub struct Render<'a, T: ?Sized>(&'a T);
-    impl<'a, T: ?Sized> Render<'a, T> {
-        pub fn new(value: &'a T) -> Self {
-            Self(value)
-        }
-    }
-    macro_rules! forward_formatting {
-        ($($trait:ident),* $(,)?) => {$(
-            impl<T: ?Sized + fmt::$trait> fmt::$trait for Render<'_, T> {
-                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    // Forward the original Formatter so flags and counts survive.
-                    fmt::$trait::fmt(self.0, formatter)
-                }
-            }
-        )*};
-    }
-    forward_formatting! {
-        Display, Debug, Binary, Octal, LowerHex, UpperHex, LowerExp, UpperExp, Pointer
-    }
-
-    // The macro passes a reference to its stable local &T binding. Using a
-    // sized reference slot avoids erasing the metadata of unsized user values.
-    pub struct Formatters<'a, T> {
-        value: &'a T,
-        display: Option<unsafe fn(*const ()) -> String>,
-        debug: Option<unsafe fn(*const ()) -> String>,
-    }
-    impl<'a, T> Formatters<'a, T> {
-        pub fn new(value: &'a T) -> Self {
-            Self {
-                value,
-                display: None,
-                debug: None,
-            }
-        }
-        pub fn display(mut self) -> Self
-        where
-            T: fmt::Display,
-        {
-            // Only instantiate this thunk when the template requires Display.
-            unsafe fn render<T: fmt::Display>(pointer: *const ()) -> String {
-                // SAFETY: attach stores a live, aligned &T with this exact thunk.
-                let value = unsafe { &*pointer.cast::<T>() };
-                format!("{}", value)
-            }
-            self.display = Some(render::<T>);
-            self
-        }
-        pub fn debug(mut self) -> Self
-        where
-            T: fmt::Debug,
-        {
-            // Debug-only arguments never instantiate the Display thunk.
-            unsafe fn render<T: fmt::Debug>(pointer: *const ()) -> String {
-                // SAFETY: attach stores a live, aligned &T with this exact thunk.
-                let value = unsafe { &*pointer.cast::<T>() };
-                format!("{:?}", value)
-            }
-            self.debug = Some(render::<T>);
-            self
-        }
-        pub fn attach(self, mut value: Value<'a>) -> Value<'a> {
-            if let Value::Opaque(opaque) = &mut value {
-                // Set pointer and both functions together so safe callers cannot
-                // combine a thunk for one type with a pointer to another type.
-                opaque.formatting_address = self.value as *const T as *const ();
-                opaque.display = self.display;
-                opaque.debug = self.debug;
-            }
-            value
-        }
-    }
-
     pub trait Capture<'a> {
         fn __introspect_fmt_capture(self) -> Value<'a>;
+    }
+
+    // With an inferred input type, method lookup may commit to the by-value
+    // primitive candidate before FromStr fixes T, preventing autoref fallback.
+    // Nightly's minimal specialization gives that candidate an opaque default;
+    // concrete primitive impls below still preserve their borrowed typed values.
+    #[cfg(feature = "nightly")]
+    impl<'a, T: ?Sized> Capture<'a> for Probe<'a, T> {
+        default fn __introspect_fmt_capture(self) -> Value<'a> {
+            (&self).__introspect_fmt_capture()
+        }
     }
 
     macro_rules! primitives {
@@ -392,10 +333,7 @@ pub mod __private {
                 type_name: type_name::<T>(),
                 address: value as *const T as *const (),
                 size: std::mem::size_of_val(value),
-                formatting_address: std::ptr::null(),
-                display: None,
-                debug: None,
-                _lifetime: PhantomData,
+                formatting: None,
             })
         }
     }

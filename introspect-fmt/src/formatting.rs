@@ -24,21 +24,42 @@ pub struct Formatters<'a, T: ?Sized> {
     _value: PhantomData<&'a T>,
 }
 
-// Explicit trait calls avoid an extra blanket reference implementation, which
-// would change Pointer output. Each method instantiates only its own bound.
+// Retained fmt::Arguments needs a statically typed wrapper. Generate its
+// forwarding alongside the erased hooks so every trait uses original T dispatch.
+#[doc(hidden)]
+pub struct Render<'a, T: ?Sized>(&'a T);
+impl<'a, T: ?Sized> Render<'a, T> {
+    pub fn new(value: &'a T) -> Self {
+        Self(value)
+    }
+}
+
 macro_rules! hooks {
     ($($method:ident => $trait:ident),* $(,)?) => {$(
-        pub fn $method(mut self) -> Self where T: fmt::$trait {
-            unsafe fn call<T: ?Sized + fmt::$trait>(address: *const (), formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                // SAFETY: the builder pairs this thunk with an &'a T reference
-                // slot of the exact same type, which outlives the returned hooks.
-                let slot = unsafe { &*address.cast::<&T>() };
-                fmt::$trait::fmt(*slot, formatter)
+        impl<T: ?Sized + fmt::$trait> fmt::$trait for Render<'_, T> {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Do not use &T's blanket impl: it changes Pointer output.
+                fmt::$trait::fmt(self.0, formatter)
             }
-            self.formatting.hooks[Kind::$trait as usize] = Some(call::<T>);
-            self
+        }
+        impl<'a, T: ?Sized> Formatters<'a, T> {
+            pub fn $method(mut self) -> Self where T: fmt::$trait {
+                unsafe fn call<T: ?Sized + fmt::$trait>(address: *const (), formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    // SAFETY: new pairs this thunk with a live &'a T slot of
+                    // the exact same type, including any DST metadata.
+                    let slot = unsafe { &*address.cast::<&T>() };
+                    fmt::$trait::fmt(*slot, formatter)
+                }
+                self.formatting.hooks[Kind::$trait as usize] = Some(call::<T>);
+                self
+            }
         }
     )*};
+}
+hooks! {
+    display => Display, debug => Debug, binary => Binary, octal => Octal,
+    lower_hex => LowerHex, upper_hex => UpperHex, lower_exp => LowerExp,
+    upper_exp => UpperExp, pointer => Pointer,
 }
 
 impl<'a, T: ?Sized> Formatters<'a, T> {
@@ -53,12 +74,6 @@ impl<'a, T: ?Sized> Formatters<'a, T> {
         }
     }
 
-    hooks! {
-        display => Display, debug => Debug, binary => Binary, octal => Octal,
-        lower_hex => LowerHex, upper_hex => UpperHex, lower_exp => LowerExp,
-        upper_exp => UpperExp, pointer => Pointer,
-    }
-
     pub fn finish(self) -> Formatting<'a> {
         self.formatting
     }
@@ -66,20 +81,17 @@ impl<'a, T: ?Sized> Formatters<'a, T> {
 
 // This proxy also lets stable Rust provide a few common option combinations
 // without building a runtime Formatter or reimplementing custom formatting.
-#[cfg(not(feature = "nightly"))]
 struct Call<'a> {
     address: *const (),
     hook: Hook,
     _borrow: PhantomData<&'a ()>,
 }
-#[cfg(not(feature = "nightly"))]
 impl fmt::Display for Call<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // SAFETY: only Formatting::render constructs Call, from a paired hook.
+        // SAFETY: only Formatting methods construct Call, from a paired hook.
         unsafe { (self.hook)(self.address, formatter) }
     }
 }
-#[cfg(not(feature = "nightly"))]
 impl fmt::Debug for Call<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
@@ -87,42 +99,61 @@ impl fmt::Debug for Call<'_> {
 }
 
 impl Formatting<'_> {
-    pub(crate) fn render(&self, spec: &Spec, output: &mut String) -> Result<bool, RenderError> {
+    pub(crate) fn default(&self, kind: Kind) -> Option<String> {
+        let call = Call {
+            address: self.address,
+            hook: self.hooks[kind as usize]?,
+            _borrow: PhantomData,
+        };
+        Some(format!("{call}"))
+    }
+
+    #[cfg(feature = "nightly")]
+    fn options(spec: &Spec) -> Result<fmt::FormattingOptions, RenderError> {
+        use fmt::{Alignment, DebugAsHex, FormattingOptions, Sign};
+        let mut options = FormattingOptions::new();
+        options
+            .fill(spec.fill)
+            .align(spec.align.map(|align| match align {
+                '<' => Alignment::Left,
+                '^' => Alignment::Center,
+                _ => Alignment::Right,
+            }))
+            .sign(
+                spec.sign
+                    .map(|sign| if sign == '+' { Sign::Plus } else { Sign::Minus }),
+            )
+            .alternate(spec.alternate)
+            .sign_aware_zero_pad(spec.zero)
+            .debug_as_hex(spec.debug_hex.map(|upper| {
+                if upper {
+                    DebugAsHex::Upper
+                } else {
+                    DebugAsHex::Lower
+                }
+            }));
+        // This unstable API currently accepts u16 counts. Never truncate a
+        // captured usize; oversized values remain explicit render errors.
+        let narrow = |value: usize| {
+            u16::try_from(value).map_err(|_| RenderError::UnsupportedSpecifier(spec.literal()))
+        };
+        options
+            .width(spec.width.map(narrow).transpose()?)
+            .precision(spec.precision.map(narrow).transpose()?);
+        Ok(options)
+    }
+
+    pub(crate) fn render(
+        &self,
+        spec: &Spec,
+        output: &mut dyn fmt::Write,
+    ) -> Result<bool, RenderError> {
         let Some(hook) = self.hooks[spec.kind as usize] else {
             return Ok(false);
         };
         #[cfg(feature = "nightly")]
         {
-            use fmt::{Alignment, DebugAsHex, FormattingOptions, Sign};
-            let mut options = FormattingOptions::new();
-            options
-                .fill(spec.fill)
-                .align(spec.align.map(|align| match align {
-                    '<' => Alignment::Left,
-                    '^' => Alignment::Center,
-                    _ => Alignment::Right,
-                }))
-                .sign(
-                    spec.sign
-                        .map(|sign| if sign == '+' { Sign::Plus } else { Sign::Minus }),
-                )
-                .alternate(spec.alternate)
-                .sign_aware_zero_pad(spec.zero)
-                .debug_as_hex(spec.debug_hex.map(|upper| {
-                    if upper {
-                        DebugAsHex::Upper
-                    } else {
-                        DebugAsHex::Lower
-                    }
-                }));
-            // This unstable API currently accepts u16 counts. Never truncate a
-            // captured usize; oversized values remain explicit render errors.
-            let narrow = |value: usize| {
-                u16::try_from(value).map_err(|_| RenderError::UnsupportedSpecifier(spec.literal()))
-            };
-            options
-                .width(spec.width.map(narrow).transpose()?)
-                .precision(spec.precision.map(narrow).transpose()?);
+            let options = Self::options(spec)?;
             let mut formatter = options.create_formatter(output);
             // SAFETY: the builder installed this exact hook and borrowed slot.
             unsafe { hook(self.address, &mut formatter) }
@@ -131,7 +162,6 @@ impl Formatting<'_> {
         }
         #[cfg(not(feature = "nightly"))]
         {
-            use fmt::Write;
             let call = Call {
                 address: self.address,
                 hook,

@@ -11,6 +11,11 @@ pub fn assert_rendered(view: &Format<'_>, expected: &str) {
         .render()
         .unwrap_or_else(|error| panic!("cannot reconstruct {:?}: {error}", view.template()));
     assert_eq!(actual, expected, "template: {:?}", view.template());
+    // Exercise the public writer API against the same oracle and with retained
+    // Arguments absent, including escapes, counts, custom traits, and DSTs.
+    let mut streamed = String::from("existing prefix: ");
+    independent.render_to(&mut streamed).unwrap();
+    assert_eq!(streamed, format!("existing prefix: {expected}"));
 }
 
 // Use only expressions without side effects here: Rust and the prototype each

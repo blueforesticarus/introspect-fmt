@@ -4,6 +4,20 @@ use introspect_fmt::{inspect_format, OpaqueValue, Value};
 use std::{cell::Cell, fmt};
 
 #[test]
+fn facade_bindings_retain_original_expression_labels_and_types() {
+    // The tracing bridge borrows operands before entering any callbacks so
+    // return/? remain in the caller; labels must not expose generated bindings.
+    let value = 31u32;
+    let binding = &value;
+    inspect_format!(@__expressions ["original.value()"] |view| {
+        assert_eq!(view.args()[0].expression(), "original.value()");
+        assert_eq!(view.args()[0].type_name(), "u32");
+        assert!(matches!(view.args()[0].value(), Value::U32(v) if std::ptr::eq(*v, &value)));
+        assert_eq!(view.render().unwrap(), "0x1f");
+    }, "{:#x}", *binding);
+}
+
+#[test]
 fn all_primitive_variants_preserve_types_and_borrow_identity() {
     // Exercise all three generated specializations without duplicating a test
     // for each numeric width. Original types differ; primitive values do not.

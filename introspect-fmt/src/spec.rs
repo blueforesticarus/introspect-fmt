@@ -16,7 +16,7 @@ pub(crate) enum Kind {
     Pointer,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Spec {
     pub fill: char,
     pub align: Option<char>,
@@ -41,6 +41,27 @@ pub(crate) fn argument<'a>(
             .find(|argument| argument.name() == Some(key))
     };
     found.ok_or_else(|| RenderError::MissingArgument(key.to_owned()))
+}
+
+// Star precision is consumed by Spec::parse before this implicit value slot.
+pub(crate) fn argument_index(
+    key: &str,
+    arguments: &[FormatArg<'_>],
+    next: &mut usize,
+) -> Result<usize, RenderError> {
+    let key = key.trim();
+    let index = if key.is_empty() {
+        let index = *next;
+        *next += 1;
+        Some(index)
+    } else if let Ok(index) = key.parse::<usize>() {
+        Some(index)
+    } else {
+        arguments.iter().position(|arg| arg.name() == Some(key))
+    };
+    index
+        .filter(|index| *index < arguments.len())
+        .ok_or_else(|| RenderError::MissingArgument(key.into()))
 }
 
 fn count_value(key: &str, arguments: &[FormatArg<'_>]) -> Result<usize, RenderError> {

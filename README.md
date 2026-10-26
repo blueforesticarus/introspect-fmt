@@ -1,6 +1,9 @@
+CODEX GENERATED: CODE MOSTLY UNREVIEWED
+
 # introspect-fmt — standalone research prototype
 
-Independent Rust workspace. **Nothing in the `tracing` repository is modified.**
+Independent Rust workspace. The parent project's vendored `tracing` crate now
+consumes this prototype through a private, callback-scoped formatting bridge.
 
 The goal is an introspectible alternative to `format_args!`: capture individual
 borrowed values with their original Rust types, then reconstruct the same string
@@ -43,6 +46,13 @@ inspect_format!(|view| {
   identifiers use the original literal's span to resolve in the caller's scope.
 - A callback-scoped `Format<'_>` avoids returning a self-referential value
   borrowing expression temporaries.
+- `OwnedTemplate::compile(&view)` creates a reusable callsite recipe;
+  `capture(&view)` produces `OwnedValue` arguments that outlive the callback.
+  Primitives retain their original types. Custom trait calls and pointer output
+  are captured as strings per placeholder, with its actual options, so repeated
+  Display/Debug uses can differ. `render(&values)` reconstructs the field without
+  retaining user values or invoking their formatters again. Borrowed rendering
+  and owned recipes share literal/placeholder parsing and count resolution.
 - Explicit arguments are evaluated once and only *borrowed*, not moved.
   `&mut T` argument expressions are evaluated once and captured by shared
   borrows of the resulting mutable reference. One match scrutinee borrows all
@@ -57,9 +67,13 @@ inspect_format!(|view| {
   on demand, using default formatting rather than the placeholder's flags.
   No trait bounds are added for unused formatting traits. The erased hooks
   retain shared borrows, including for mutable-reference expressions and DSTs.
-- Primitive detection uses safe, stable **autoref-based specialization** at the
-  proc-macro expansion site. It does not rely on `Any`, `TypeId`, unstable
-  specialization, or requiring `T: 'static`.
+  These methods and reconstruction borrow one shared nine-trait dispatch table;
+  no separate Display/Debug erased-pointer machinery is retained.
+- Stable primitive detection uses safe **autoref-based specialization** at the
+  proc-macro expansion site. With `nightly`, minimal specialization also supplies
+  an opaque default for by-value probes, allowing types inferred later (such as
+  `FromStr` errors) and preserving primitive capture through generic functions.
+  Neither path requires `Any`, `TypeId`, or `T: 'static`.
 - Format strings with implicit captures (`"{name}"`, `"{x:>width$}"`) are
   scanned to expose the captured variables. This scanner is best-effort and
   does not validate the Rust format grammar.
@@ -68,14 +82,18 @@ inspect_format!(|view| {
   borrowed reference slot preserves DST metadata and original Pointer dispatch.
   Repeated placeholders reuse these hooks with different options; unused traits
   introduce no bounds. Hook capture allocates nothing and never formats eagerly.
-- `Format::render()` independently handles literals, escaping, argument selection,
-  and positional/named/star counts. It never reads the retained formatter.
+- `Format::render_to(&mut impl fmt::Write)` independently handles literals,
+  escaping, argument selection, and positional/named/star counts. It never reads
+  the retained formatter.
   With the opt-in `nightly` feature, `formatting_options` constructs a real
   `Formatter` per placeholder and calls the original trait implementation,
   writing directly into the output buffer. Without it, stable format calls cover
   default traits, common Debug flags, and ordinary width/precision/alignment;
   a small primitive fallback handles additional options. Unsupported combinations
-  return `RenderError`; the complete message is never delegated.
+  return `RenderError`; the complete message is never delegated. `render()` is a
+  convenience wrapper that collects the streamed output into a `String`. Writer
+  and user formatter errors propagate immediately, and errors can leave partial
+  output. The default tracing visitor uses the streaming path directly.
 - `fmt::Arguments` is retained for analyzed literal templates, including implicit
   captures and dynamic counts. Implicit captures become explicit named operands;
   count operands remain `usize`, while a borrowed wrapper forwards the original
@@ -119,8 +137,8 @@ are not required to receive compiler-identical diagnostics.
 6. `OpaqueValue` exposes an address and size for *diagnostic purposes only*;
    these do not enable safe downcasting. Its Display/Debug hooks exist only for
    traits requested in a scanned literal template. These introspection methods
-   allocate default-formatted strings on demand. Reconstruction separately uses
-   the per-argument hooks for all nine formatting traits, without caching output.
+   allocate default-formatted strings on demand. Reconstruction uses the same
+   per-argument hooks for all nine formatting traits, without caching output.
    Macro-generated templates acquire hooks only with `nightly`.
 7. Explicit arguments are borrowed as `&(expression)` in one match scrutinee
    to preserve non-moving behavior and statement-scoped temporary lifetimes.
@@ -129,6 +147,7 @@ are not required to receive compiler-identical diagnostics.
    compatibility.
 8. The nightly `FormattingOptions` API currently accepts `u16` width/precision.
    Larger counts return an explicit reconstruction error rather than truncating.
+   The pinned standard formatter also rejects counts beyond this limit.
    The nightly toolchain and APIs are pinned through the Fenix flake input.
 
 ## Features
@@ -147,6 +166,8 @@ expansion. After expansion, capture, primitive introspection, trait selection,
 and count resolution use the same implementation as direct literals.
 The default flake shell supplies Fenix nightly; `nix develop .#stable` supplies
 Fenix stable for checking that the fallback has no unstable API dependency.
+The primitive padding path avoids post-1.71 standard-library APIs; the nightly
+feature requirement is separate from that compatibility constraint.
 
 ## Tests
 
