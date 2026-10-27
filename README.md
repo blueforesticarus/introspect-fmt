@@ -46,13 +46,20 @@ inspect_format!(|view| {
   identifiers use the original literal's span to resolve in the caller's scope.
 - A callback-scoped `Format<'_>` avoids returning a self-referential value
   borrowing expression temporaries.
-- `OwnedTemplate::compile(&view)` creates a reusable callsite recipe;
-  `capture(&view)` produces `OwnedValue` arguments that outlive the callback.
-  Primitives retain their original types. Custom trait calls and pointer output
-  are captured as strings per placeholder, with its actual options, so repeated
-  Display/Debug uses can differ. `render(&values)` reconstructs the field without
-  retaining user values or invoking their formatters again. Borrowed rendering
-  and owned recipes share literal/placeholder parsing and count resolution.
+- One placeholder grammar (`grammar.rs`) is shared by the runtime and the proc
+  macro. For a literal template the macro emits one type-independent
+  `static Parsed` per invocation, holding only the placeholders;
+  `view.recipe()` pairs it with the source. Every call and generic instance
+  shares it. Nonliteral templates have none and are parsed at runtime.
+- `Recipe::new(&view)` pairs the template with the captured argument kinds, which
+  select the slot layout. `recipe.capture(&view, &mut sink)` writes slots through
+  a `CaptureSink` (for example `Vec<OwnedValue>`): primitives in argument order,
+  with their original types, then one string per placeholder whose argument is
+  opaque or formats a pointer, rendered with that placeholder's actual options,
+  so repeated Display/Debug uses can differ. `recipe.render(&slots)` reconstructs
+  the field from any `Slots` without retaining user values or invoking their
+  formatters again. `Recipe::parse(source, names, kinds)` rebuilds a recipe from
+  portable parts.
 - Explicit arguments are evaluated once and only *borrowed*, not moved.
   `&mut T` argument expressions are evaluated once and captured by shared
   borrows of the resulting mutable reference. One match scrutinee borrows all
@@ -76,7 +83,9 @@ inspect_format!(|view| {
   Neither path requires `Any`, `TypeId`, or `T: 'static`.
 - Format strings with implicit captures (`"{name}"`, `"{x:>width$}"`) are
   scanned to expose the captured variables. This scanner is best-effort and
-  does not validate the Rust format grammar.
+  does not validate the Rust format grammar. Separately, literal templates are
+  parsed with the runtime's own grammar into the static template; templates it
+  rejects get none and report the same error when rendered.
 - Each `FormatArg` additionally holds optional hooks for the original value's
   requested formatting traits, including primitives and references. A shared
   borrowed reference slot preserves DST metadata and original Pointer dispatch.

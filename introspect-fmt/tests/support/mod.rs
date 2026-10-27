@@ -16,6 +16,28 @@ pub fn assert_rendered(view: &Format<'_>, expected: &str) {
     let mut streamed = String::from("existing prefix: ");
     independent.render_to(&mut streamed).unwrap();
     assert_eq!(streamed, format!("existing prefix: {expected}"));
+    // A compile-time recipe must equal the runtime parse and render the same,
+    // borrowed and after owned capture.
+    if let Some(recipe) = view.recipe() {
+        let names: Vec<_> = view.args().iter().map(|arg| arg.name()).collect();
+        let kinds: Vec<_> = view.kinds().collect();
+        let parsed = introspect_fmt::Recipe::parse(view.template(), &names, &kinds).unwrap();
+        assert_eq!(recipe, parsed.template(), "template: {:?}", view.template());
+        assert_eq!(view.render().unwrap(), expected);
+        #[cfg(feature = "nightly")]
+        {
+            let recipe = introspect_fmt::Recipe::new(view).unwrap();
+            let mut values = Vec::new();
+            recipe.capture(view, &mut values).unwrap();
+            let owned = recipe.render(&values[..]);
+            assert_eq!(
+                owned.as_deref(),
+                Ok(expected),
+                "template: {:?}",
+                view.template()
+            );
+        }
+    }
 }
 
 // Use only expressions without side effects here: Rust and the prototype each

@@ -7,6 +7,7 @@ name = "introspect-fmt"
 version = "0.1.0"
 dependencies = [
  "introspect-fmt-macros",
+ "smallvec",
 ]
 
 [[package]]
@@ -35,6 +36,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "smallvec"
+version = "1.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "syn"

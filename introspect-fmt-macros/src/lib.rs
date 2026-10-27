@@ -15,6 +15,11 @@ use syn::{
     parse_macro_input, Expr, ExprClosure, ExprLit, Ident, Lit, LitStr, Result, Token,
 };
 
+// The runtime's grammar, so emitted recipes match its own parsing exactly.
+#[allow(dead_code)]
+#[path = "../../introspect-fmt/src/grammar.rs"]
+mod grammar;
+
 enum InputArg {
     Positional(Expr),
     Named(Ident, Expr),
@@ -96,7 +101,7 @@ enum ArgumentKey {
 struct RequiredTraits(u16);
 
 impl RequiredTraits {
-    // Keep trait bits aligned with the runtime's Kind order. Count-only inputs
+    // Keep trait bits aligned with grammar::FormatTrait's order. Count-only inputs
     // have no bits and therefore acquire no formatting trait bounds.
     fn from_spec(spec: &str) -> Self {
         Self(match spec {
@@ -310,6 +315,55 @@ fn trait_formatters(
     quote! { #runtime::__private::TraitFormatters::new(&#temp) #(.#methods())* .finish() }
 }
 
+// A literal template's recipe depends only on its text and argument names, so
+// one static serves every call and generic instantiation of this invocation.
+// Unsupported templates emit nothing; the runtime then reports the same error.
+fn recipe(runtime: &TokenStream2, source: &str, names: &[Option<String>]) -> Option<TokenStream2> {
+    let placeholders = grammar::Parser::new(source, names.len(), |key| {
+        names.iter().position(|name| name.as_deref() == Some(key))
+    })
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .ok()?;
+    let arguments = u16::try_from(names.len()).ok()?;
+    let count = |count: Option<grammar::Count>| match count {
+        None => quote!(::core::option::Option::None),
+        Some(grammar::Count::Literal(value)) => {
+            quote!(::core::option::Option::Some(#runtime::Count::Literal(#value)))
+        }
+        Some(grammar::Count::Argument(index)) => {
+            quote!(::core::option::Option::Some(#runtime::Count::Argument(#index)))
+        }
+    };
+    let placeholders = placeholders.iter().map(|placeholder| {
+        let grammar::Placeholder {
+            start,
+            end,
+            argument,
+            spec,
+        } = placeholder;
+        let fill = spec.fill;
+        let flags = spec.flags;
+        let kind = Ident::new(&format!("{:?}", spec.kind), Span::call_site());
+        let (width, precision) = (count(spec.width), count(spec.precision));
+        quote! {
+            #runtime::Placeholder {
+                start: #start, end: #end, argument: #argument,
+                spec: #runtime::FormatSpec {
+                    fill: #fill, flags: #flags, kind: #runtime::FormatTrait::#kind,
+                    width: #width, precision: #precision,
+                },
+            }
+        }
+    });
+    let recipe = format_ident!("__INTROSPECT_FMT_RECIPE", span = Span::mixed_site());
+    Some(quote! {
+        // The source stays with Format::template; the static holds one pointer.
+        static #recipe: #runtime::Parsed = #runtime::Parsed::new_unchecked(
+            &[#(#placeholders),*], #arguments,
+        );
+    })
+}
+
 #[cfg(feature = "nightly")]
 fn expand_template(format: Expr) -> Result<Expr> {
     let mut analyzed = &format;
@@ -363,13 +417,19 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     let mut descriptors = Vec::new();
     let mut fmt_args = Vec::new();
     let mut explicitly_named = HashSet::new();
+    // Format argument names in descriptor order, for the static recipe.
+    let mut names = Vec::new();
 
     for (i, arg) in args.iter().enumerate() {
         let temp = format_ident!("__introspect_fmt_arg_{}", i, span = Span::mixed_site());
         let (name, expr) = match arg {
-            InputArg::Positional(expr) => (None, expr),
+            InputArg::Positional(expr) => {
+                names.push(None);
+                (None, expr)
+            }
             InputArg::Named(ident, expr) => {
                 explicitly_named.insert(argument_name(ident));
+                names.push(Some(argument_name(ident)));
                 (Some(ident), expr)
             }
         };
@@ -445,6 +505,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
             let Some(mut ident) = parse_format_ident(name) else {
                 continue;
             };
+            names.push(Some(name.clone()));
             // A captured keyword variable is spelled r#keyword in Rust code;
             // receiver/path keywords cannot be raw and retain their spelling.
             if syn::parse_str::<Ident>(name).is_err()
@@ -501,9 +562,20 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
     } else {
         quote! { ::core::option::Option::None }
     };
+    let (recipe, with_recipe) = match literal
+        .as_deref()
+        .and_then(|source| recipe(&runtime, source, &names))
+    {
+        Some(item) => {
+            let name = format_ident!("__INTROSPECT_FMT_RECIPE", span = Span::mixed_site());
+            (item, quote! { .with_recipe(&#name) })
+        }
+        None => (quote! {}, quote! {}),
+    };
 
     let expanded = quote! {{
         use #runtime::__private::Capture as _;
+        #recipe
         // Nonliteral templates are evaluated here exactly once; only inert
         // literals (including nightly-expanded ones) also reach format_args!.
         let __introspect_fmt_template: &'static str = #format;
@@ -517,7 +589,7 @@ pub fn inspect_format(tokens: TokenStream) -> TokenStream {
                     __introspect_fmt_template,
                     &__introspect_fmt_values,
                     #rendered,
-                ), #callback)
+                ) #with_recipe, #callback)
             }
         }
     }};

@@ -11,3 +11,5 @@ nightly = ["introspect-fmt-macros/nightly"]
 
 [dependencies]
 introspect-fmt-macros = { path = "../introspect-fmt-macros" }
+# Argument kinds stay inline in recipes for typical argument counts.
+smallvec = "1.15"

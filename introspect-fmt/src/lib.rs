@@ -25,12 +25,18 @@ macro_rules! inspect_format {
 }
 
 mod formatting;
+// Also included by the proc macro, which emits its parsed placeholders.
+mod grammar;
 mod owned;
-pub use owned::{OwnedTemplate, OwnedValue, TemplateArgument, TemplatePiece};
+mod recipe;
 mod render;
 mod spec;
 mod template;
+pub use grammar::{Count, FormatSpec, FormatTrait, Placeholder};
+pub use owned::OwnedValue;
+pub use recipe::Recipe;
 pub use render::RenderError;
+pub use template::{CaptureSink, Parsed, Slots, Template};
 
 /// Each argument in its original macro order, followed by any implicitly
 /// captured named variables in order of first use.
@@ -111,27 +117,39 @@ pub enum Value<'a> {
     Opaque(OpaqueValue<'a>),
 }
 
+macro_rules! argument_kinds {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        /// A captured argument's representation. Together with a `Template`,
+        /// argument kinds determine the captured value slot layout.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum ArgumentKind { $($variant,)* Opaque }
+        impl ArgumentKind {
+            /// Stable lowercase Rust spelling, or "opaque".
+            pub fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name,)* Self::Opaque => "opaque" }
+            }
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name { $($name => Some(Self::$variant),)* "opaque" => Some(Self::Opaque), _ => None }
+            }
+        }
+        impl Value<'_> {
+            pub fn kind(&self) -> ArgumentKind {
+                match self { $(Self::$variant(_) => ArgumentKind::$variant,)* Self::Opaque(_) => ArgumentKind::Opaque }
+            }
+        }
+    };
+}
+argument_kinds! {
+    Bool => "bool", Char => "char", I8 => "i8", I16 => "i16", I32 => "i32", I64 => "i64",
+    I128 => "i128", Isize => "isize", U8 => "u8", U16 => "u16", U32 => "u32", U64 => "u64",
+    U128 => "u128", Usize => "usize", F32 => "f32", F64 => "f64", Str => "str",
+}
+
 impl Value<'_> {
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Bool(_) => "bool",
-            Self::Char(_) => "char",
-            Self::I8(_) => "i8",
-            Self::I16(_) => "i16",
-            Self::I32(_) => "i32",
-            Self::I64(_) => "i64",
-            Self::I128(_) => "i128",
-            Self::Isize(_) => "isize",
-            Self::U8(_) => "u8",
-            Self::U16(_) => "u16",
-            Self::U32(_) => "u32",
-            Self::U64(_) => "u64",
-            Self::U128(_) => "u128",
-            Self::Usize(_) => "usize",
-            Self::F32(_) => "f32",
-            Self::F64(_) => "f64",
-            Self::Str(_) => "str",
             Self::Opaque(v) => v.type_name,
+            value => value.kind().name(),
         }
     }
 }
@@ -177,6 +195,7 @@ pub type Opaque<'a> = OpaqueValue<'a>;
 #[derive(Debug)]
 pub struct Format<'a> {
     template: &'static str,
+    recipe: Option<&'static Parsed>,
     arguments: &'a [FormatArg<'a>],
     rendered: Option<fmt::Arguments<'a>>,
 }
@@ -189,15 +208,35 @@ impl<'a> Format<'a> {
     ) -> Self {
         Self {
             template,
+            recipe: None,
             arguments,
             rendered,
         }
     }
+    #[doc(hidden)]
+    pub fn with_recipe(mut self, recipe: &'static Parsed) -> Self {
+        self.recipe = Some(recipe);
+        self
+    }
     pub fn template(&self) -> &'static str {
         self.template
     }
+    /// The invocation's parsed template, emitted at compile time for literal
+    /// templates. Its placeholders are one static, shared across calls and
+    /// generic instances.
+    pub fn recipe(&self) -> Option<Template<'static>> {
+        self.recipe.map(|parsed| parsed.template(self.template))
+    }
+    pub(crate) fn parsed(&self) -> Option<&'static Parsed> {
+        self.recipe
+    }
     pub fn args(&self) -> &[FormatArg<'a>] {
         self.arguments
+    }
+    pub fn kinds(&self) -> impl Iterator<Item = ArgumentKind> + '_ {
+        self.arguments
+            .iter()
+            .map(|argument| argument.value().kind())
     }
     /// Reconstruct from the template, typed primitives, and opaque hooks.
     /// Does not read retained `fmt::Arguments`. Unsupported options return an
@@ -212,7 +251,20 @@ impl<'a> Format<'a> {
     /// failure returns `RenderError::FormattingFailed`.
     /// Like `render`, this never reads retained `fmt::Arguments`.
     pub fn render_to(&self, output: &mut impl fmt::Write) -> Result<(), RenderError> {
-        render::render_to(self.template, self.arguments, output)
+        match self.recipe() {
+            Some(recipe) => template::render_borrowed(
+                recipe.source(),
+                recipe.placeholders().iter().copied().map(Ok),
+                self.arguments,
+                output,
+            ),
+            None => template::render_borrowed(
+                self.template,
+                template::parse(self.template, self.arguments),
+                self.arguments,
+                output,
+            ),
+        }
     }
     /// `None` means this prototype deliberately declined to reconstruct
     /// standard formatting, not that any argument was omitted.

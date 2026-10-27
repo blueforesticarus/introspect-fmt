@@ -1,5 +1,5 @@
-//! Independent reconstruction from the public template and captured values.
-//! Format one value at a time; never delegate the full message to Rust's
+//! Independent per-argument reconstruction; template.rs walks literals and
+//! placeholders. Format one value at a time; never delegate the full message to Rust's
 //! formatter or read the optional retained formatting arguments.
 
 use crate::{
@@ -21,7 +21,9 @@ pub enum RenderError {
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidTemplate => formatter.write_str("unmatched brace in template"),
+            Self::InvalidTemplate => {
+                formatter.write_str("unmatched brace, or captured values do not fit the template")
+            }
             Self::MissingArgument(name) => write!(formatter, "argument {name:?} was not captured"),
             Self::UnsupportedSpecifier(spec) => {
                 write!(formatter, "unsupported format specifier {spec:?}")
@@ -42,29 +44,6 @@ fn formatting<'a>(argument: &'a FormatArg<'_>) -> Option<&'a crate::formatting::
     })
 }
 
-// This interface deliberately cannot access Format's retained formatter.
-// Stream the same literal/placeholder traversal used by owned recipe capture.
-pub(crate) fn render_to(
-    template: &str,
-    arguments: &[FormatArg<'_>],
-    output: &mut dyn fmt::Write,
-) -> Result<(), RenderError> {
-    let mut next = 0;
-    for piece in crate::template::pieces(template) {
-        match piece? {
-            crate::template::Piece::Literal(text) => output
-                .write_str(text)
-                .map_err(|_| RenderError::FormattingFailed)?,
-            crate::template::Piece::Argument { key, spec } => {
-                let spec = Spec::parse(spec, arguments, &mut next)?;
-                let index = crate::spec::argument_index(key, arguments, &mut next)?;
-                render_argument(&arguments[index], &spec, output)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 // Shared by borrowed rendering and owned capture so custom trait options agree.
 pub(crate) fn render_argument(
     argument: &FormatArg<'_>,
@@ -82,7 +61,7 @@ pub(crate) fn render_argument(
 }
 
 // Fixed per-value formats reuse Rust's primitive implementations. The message's
-// argument selection, literal pieces, and escaping are reconstructed above.
+// argument selection, literal pieces, and escaping are reconstructed in template.rs.
 fn basic<T: ?Sized + fmt::Display + fmt::Debug>(
     value: &T,
     spec: &str,

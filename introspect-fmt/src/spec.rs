@@ -1,20 +1,13 @@
-//! Shared format grammar and count resolution for both rendering backends.
+//! Resolved placeholder options for both rendering backends. Parsing lives in
+//! grammar.rs; this only substitutes dynamic counts into a parsed spec.
 //! Keep counts as usize until a backend explicitly validates its API limits.
 
-use crate::{FormatArg, RenderError, Value};
+use crate::{
+    grammar::{Count, FormatSpec},
+    RenderError,
+};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Kind {
-    Display,
-    Debug,
-    Binary,
-    Octal,
-    LowerHex,
-    UpperHex,
-    LowerExp,
-    UpperExp,
-    Pointer,
-}
+pub(crate) use crate::grammar::FormatTrait as Kind;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Spec {
@@ -29,145 +22,28 @@ pub(crate) struct Spec {
     pub debug_hex: Option<bool>,
 }
 
-pub(crate) fn argument<'a>(
-    key: &str,
-    arguments: &'a [FormatArg<'_>],
-) -> Result<&'a FormatArg<'a>, RenderError> {
-    let found = if let Ok(index) = key.parse::<usize>() {
-        arguments.get(index)
-    } else {
-        arguments
-            .iter()
-            .find(|argument| argument.name() == Some(key))
-    };
-    found.ok_or_else(|| RenderError::MissingArgument(key.to_owned()))
-}
-
-// Star precision is consumed by Spec::parse before this implicit value slot.
-pub(crate) fn argument_index(
-    key: &str,
-    arguments: &[FormatArg<'_>],
-    next: &mut usize,
-) -> Result<usize, RenderError> {
-    let key = key.trim();
-    let index = if key.is_empty() {
-        let index = *next;
-        *next += 1;
-        Some(index)
-    } else if let Ok(index) = key.parse::<usize>() {
-        Some(index)
-    } else {
-        arguments.iter().position(|arg| arg.name() == Some(key))
-    };
-    index
-        .filter(|index| *index < arguments.len())
-        .ok_or_else(|| RenderError::MissingArgument(key.into()))
-}
-
-fn count_value(key: &str, arguments: &[FormatArg<'_>]) -> Result<usize, RenderError> {
-    match argument(key, arguments)?.value() {
-        Value::Usize(value) => Ok(**value),
-        // Nonliteral templates do not provide the macro's usize inference.
-        // Report the limitation rather than silently accepting another type.
-        _ => Err(RenderError::UnsupportedSpecifier(format!(
-            "count {key} must be usize"
-        ))),
-    }
-}
-
-fn count(rest: &mut &str, arguments: &[FormatArg<'_>]) -> Result<Option<usize>, RenderError> {
-    // A count ending in '$' may be a Unicode name or a positional index.
-    if let Some(end) = rest.find('$') {
-        let key = &rest[..end];
-        if !key.is_empty() && !key.contains('.') {
-            let value = count_value(key, arguments)?;
-            *rest = &rest[end + 1..];
-            return Ok(Some(value));
-        }
-    }
-    let end = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if end == 0 {
-        return Ok(None);
-    }
-    let value = rest[..end]
-        .parse()
-        .map_err(|_| RenderError::UnsupportedSpecifier((*rest).to_owned()))?;
-    *rest = &rest[end..];
-    Ok(Some(value))
-}
-
 impl Spec {
-    pub fn parse(
-        spec: &str,
-        arguments: &[FormatArg<'_>],
-        next: &mut usize,
+    /// `count` reads a usize argument by index; literal counts need no lookup.
+    pub fn resolve(
+        spec: &FormatSpec,
+        count: impl Fn(u16) -> Result<usize, RenderError>,
     ) -> Result<Self, RenderError> {
-        let invalid = || RenderError::UnsupportedSpecifier(spec.to_owned());
-        let mut rest = spec.trim_end();
-        let mut result = Self {
-            fill: ' ',
-            align: None,
-            sign: None,
-            alternate: false,
-            zero: false,
-            width: None,
-            precision: None,
-            kind: Kind::Display,
-            debug_hex: None,
+        let resolve = |value: Option<Count>| match value {
+            None => Ok(None),
+            Some(Count::Literal(value)) => Ok(Some(usize::from(value))),
+            Some(Count::Argument(index)) => count(index).map(Some),
         };
-        let mut chars = rest.chars();
-        let first = chars.next();
-        let second = chars.next();
-        if second.is_some_and(|ch| matches!(ch, '<' | '^' | '>')) {
-            result.fill = first.unwrap();
-            result.align = second;
-            rest = &rest[result.fill.len_utf8() + 1..];
-        } else if first.is_some_and(|ch| matches!(ch, '<' | '^' | '>')) {
-            result.align = first;
-            rest = &rest[1..];
-        }
-        if rest.starts_with(['+', '-']) {
-            result.sign = rest.chars().next();
-            rest = &rest[1..];
-        }
-        if let Some(tail) = rest.strip_prefix('#') {
-            result.alternate = true;
-            rest = tail;
-        }
-        // `0$` references argument zero; `08` and `0width$` start with a flag.
-        if rest.starts_with('0') && !rest.starts_with("0$") {
-            result.zero = true;
-            rest = &rest[1..];
-        }
-        result.width = count(&mut rest, arguments)?;
-        if let Some(tail) = rest.strip_prefix('.') {
-            rest = tail;
-            result.precision = if let Some(tail) = rest.strip_prefix('*') {
-                rest = tail;
-                let value = count_value(&next.to_string(), arguments)?;
-                *next += 1;
-                Some(value)
-            } else {
-                Some(count(&mut rest, arguments)?.ok_or_else(invalid)?)
-            };
-        }
-        result.kind = match rest {
-            "" => Kind::Display,
-            "?" => Kind::Debug,
-            "x?" | "X?" => {
-                result.debug_hex = Some(rest == "X?");
-                Kind::Debug
-            }
-            "b" => Kind::Binary,
-            "o" => Kind::Octal,
-            "x" => Kind::LowerHex,
-            "X" => Kind::UpperHex,
-            "e" => Kind::LowerExp,
-            "E" => Kind::UpperExp,
-            "p" => Kind::Pointer,
-            _ => return Err(invalid()),
-        };
-        Ok(result)
+        Ok(Self {
+            fill: spec.fill,
+            align: spec.align(),
+            sign: spec.sign(),
+            alternate: spec.alternate(),
+            zero: spec.zero(),
+            width: resolve(spec.width)?,
+            precision: resolve(spec.precision)?,
+            kind: spec.kind,
+            debug_hex: spec.debug_hex(),
+        })
     }
 
     pub fn suffix(&self) -> &'static str {

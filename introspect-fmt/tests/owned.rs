@@ -1,16 +1,29 @@
 //! Owned recipes must render after original values and trait hooks are gone.
-use introspect_fmt::{inspect_format, OwnedTemplate, OwnedValue};
+use introspect_fmt::{inspect_format, ArgumentKind, Format, OwnedValue, Placeholder, Recipe};
+
+// Capture through the invocation's static template, which must equal a runtime parse.
+fn capture(view: &Format<'_>) -> (Recipe, Vec<ArgumentKind>, Vec<OwnedValue>) {
+    let template = view
+        .recipe()
+        .expect("literal templates carry a static recipe");
+    let names: Vec<_> = view.args().iter().map(|arg| arg.name()).collect();
+    let kinds: Vec<_> = view.kinds().collect();
+    let parsed = Recipe::parse(view.template(), &names, &kinds).unwrap();
+    assert_eq!(template, parsed.template());
+    let recipe = Recipe::new(view).unwrap();
+    assert_eq!(recipe, parsed);
+    let mut values = Vec::new();
+    recipe.capture(view, &mut values).unwrap();
+    assert_eq!(values.len(), recipe.value_count());
+    (recipe, kinds, values)
+}
 
 #[test]
 fn primitive_capture_outlives_inputs_and_preserves_argument_order() {
-    let (template, values) = {
+    let (template, _, values) = {
         let text = String::from("héllo");
         inspect_format!(
-            |view| {
-                let template = OwnedTemplate::compile(&view).unwrap();
-                let values = template.capture(&view).unwrap();
-                (template, values)
-            },
+            |view| capture(&view),
             "{text:?} {}{:x} {3:.*}",
             4usize,
             -1i8,
@@ -22,11 +35,59 @@ fn primitive_capture_outlives_inputs_and_preserves_argument_order() {
     assert!(matches!(values[1], OwnedValue::I8(-1)));
     assert!(matches!(values[3], OwnedValue::F32(_)));
     assert_eq!(
-        template.render(&values).unwrap(),
+        template.render(&values[..]).unwrap(),
         format!("{:?} {}{:x} {:.4}", "héllo", 4, -1i8, 1.234567f32)
     );
 }
 
+#[test]
+fn recipes_are_static_per_invocation_and_compact() {
+    fn emit<T: std::fmt::Display>(value: T) -> (*const Placeholder, Vec<ArgumentKind>) {
+        inspect_format!(
+            |view| {
+                let placeholders = view.recipe().unwrap().placeholders().as_ptr();
+                (placeholders, view.kinds().collect())
+            },
+            "value {value}"
+        )
+    }
+    struct Custom;
+    impl std::fmt::Display for Custom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("custom")
+        }
+    }
+    // Generic instances share the recipe; only their captured kinds differ.
+    let (first, number) = emit(42u32);
+    let (second, text) = emit("hello");
+    let (third, opaque) = emit(Custom);
+    assert!(first == second && second == third);
+    assert_ne!(number, opaque);
+    assert_eq!(text, [ArgumentKind::Str]);
+    assert_eq!(opaque, [ArgumentKind::Opaque]);
+    // Every invocation emits one Parsed (one pointer, no source) and its
+    // placeholders into the caller's binary.
+    assert_eq!(std::mem::size_of::<Placeholder>(), 24);
+    assert_eq!(std::mem::size_of::<introspect_fmt::Parsed>(), 24);
+}
+
+#[test]
+fn nonliteral_templates_parse_at_runtime() {
+    let source: &'static str = "{} and {name}";
+    let rendered = inspect_format!(
+        |view| {
+            assert!(view.recipe().is_none());
+            let recipe = Recipe::new(&view).unwrap();
+            let mut values = Vec::new();
+            recipe.capture(&view, &mut values).unwrap();
+            recipe.render(&values[..]).unwrap()
+        },
+        source,
+        1u8,
+        name = "two"
+    );
+    assert_eq!(rendered, "1 and two");
+}
 #[cfg(feature = "nightly")]
 #[test]
 fn custom_traits_are_rendered_once_per_occurrence_with_actual_options() {
@@ -49,14 +110,10 @@ fn custom_traits_are_rendered_once_per_occurrence_with_actual_options() {
         }
     }
     let calls = Cell::new(0);
-    let (template, values) = {
+    let (template, _, values) = {
         let custom = Custom(&calls);
         inspect_format!(
-            |view| {
-                let template = OwnedTemplate::compile(&view).unwrap();
-                let values = template.capture(&view).unwrap();
-                (template, values)
-            },
+            |view| capture(&view),
             "{0:*>width$.precision$}|{0:#?}{0:?}",
             custom,
             width = 10,
@@ -65,11 +122,11 @@ fn custom_traits_are_rendered_once_per_occurrence_with_actual_options() {
     };
     assert_eq!(calls.get(), 3);
     assert_eq!(
-        template.render(&values).unwrap(),
+        template.render(&values[..]).unwrap(),
         "******disp|alternate debugdebug"
     );
     assert_eq!(
-        template.render(&values).unwrap(),
+        template.render(&values[..]).unwrap(),
         "******disp|alternate debugdebug"
     );
     assert_eq!(calls.get(), 3); // Reading stored values never invokes user code.
@@ -79,7 +136,7 @@ fn custom_traits_are_rendered_once_per_occurrence_with_actual_options() {
 #[test]
 fn dynamic_counts_change_without_recompiling_and_brace_fill_survives() {
     let template = inspect_format!(
-        |view| OwnedTemplate::compile(&view).unwrap(),
+        |view| capture(&view).0,
         "{{{value:}>width$.precision$}}} {value:x?}",
         value = "héllo",
         width = 10,
@@ -87,10 +144,11 @@ fn dynamic_counts_change_without_recompiling_and_brace_fill_survives() {
     );
     inspect_format!(
         |view| {
-            assert!(template.matches(&view));
-            let values = template.capture(&view).unwrap();
+            // A separate invocation has its own static, but the same recipe.
+            assert_eq!(view.recipe().unwrap(), template.template());
+            let (_, _, values) = capture(&view);
             assert_eq!(
-                template.render(&values).unwrap(),
+                template.render(&values[..]).unwrap(),
                 format!(
                     "{{{value:}>width$.precision$}}} {value:x?}",
                     value = "héllo",
@@ -111,18 +169,19 @@ fn dynamic_counts_change_without_recompiling_and_brace_fill_survives() {
 fn opaque_generic_primitives_do_not_reuse_a_typed_schema() {
     // Method selection in a generic function can produce Opaque(u32), whose
     // Rust type name equals the name of an inspectable primitive u32.
-    fn generic<T: std::fmt::Display>(value: T, typed: &OwnedTemplate) -> String {
+    fn generic<T: std::fmt::Display>(value: T, typed: &[ArgumentKind]) -> String {
         inspect_format!(
             |view| {
-                assert!(!typed.matches(&view));
-                let opaque = OwnedTemplate::compile(&view).unwrap();
-                opaque.render(&opaque.capture(&view).unwrap()).unwrap()
+                let (template, kinds, values) = capture(&view);
+                assert_ne!(kinds, typed);
+                template.render(&values[..]).unwrap()
             },
             "{value}"
         )
     }
     let value = 42u32;
-    let typed = inspect_format!(|view| OwnedTemplate::compile(&view).unwrap(), "{value}");
+    let typed = inspect_format!(|view| capture(&view).1, "{value}");
+    assert_eq!(typed, [ArgumentKind::U32]);
     assert_eq!(generic(value, &typed), "42");
 }
 
@@ -144,4 +203,59 @@ fn capture_allows_type_inference_from_a_later_parse_result() {
         Ok(value)
     }
     assert_eq!(parse().unwrap(), std::net::Ipv4Addr::LOCALHOST);
+}
+
+#[test]
+fn runtime_recipes_match_argument_names_not_just_source() {
+    let source: &'static str = "{x}";
+    let template = inspect_format!(|view| Recipe::new(&view).unwrap(), source, x = 1u8, y = 2u8);
+    // Same source, but `{x}` now resolves to argument 1.
+    inspect_format!(
+        |view| {
+            assert!(!template.matches(&view));
+            assert_eq!(view.render().unwrap(), "4");
+        },
+        source,
+        y = 3u8,
+        x = 4u8
+    );
+    inspect_format!(
+        |view| assert!(template.matches(&view)),
+        source,
+        x = 5u8,
+        y = 6u8
+    );
+}
+
+#[test]
+fn long_templates_parse_and_only_late_placeholders_are_rejected() {
+    let tail = "x".repeat(70_000);
+    let long: &'static str = format!("{{}}{tail}").leak();
+    inspect_format!(
+        |view| {
+            let template = Recipe::new(&view).unwrap();
+            assert_eq!(template.template().placeholders().len(), 1);
+            assert_eq!(view.render().unwrap(), format!("7{tail}"));
+        },
+        long,
+        7u8
+    );
+    let late: &'static str = format!("{tail}{{}}").leak();
+    inspect_format!(|view| assert!(Recipe::new(&view).is_err()), late, 7u8);
+}
+
+#[test]
+fn nonliteral_non_usize_counts_are_rejected_before_capture() {
+    let source: &'static str = "{0:1$}";
+    inspect_format!(
+        |view| {
+            let template = Recipe::new(&view).unwrap();
+            let mut values = Vec::new();
+            assert!(template.capture(&view, &mut values).is_err());
+            assert!(values.is_empty());
+        },
+        source,
+        5u32,
+        3u32
+    );
 }
