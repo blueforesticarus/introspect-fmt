@@ -238,6 +238,18 @@ impl<'a> Format<'a> {
             .iter()
             .map(|argument| argument.value().kind())
     }
+    /// Borrow the same arguments and parsed recipe without retaining
+    /// `fmt::Arguments`. Rendering still uses the invocation's static metadata.
+    pub fn without_formatted(&self) -> Self {
+        // Rebuilding through `new` would discard the compile-time recipe and
+        // make adapters parse literal templates again on every event.
+        Self {
+            template: self.template,
+            recipe: self.recipe,
+            arguments: self.arguments,
+            rendered: None,
+        }
+    }
     /// Reconstruct from the template, typed primitives, and opaque hooks.
     /// Does not read retained `fmt::Arguments`. Unsupported options return an
     /// error rather than producing a string with different formatting.

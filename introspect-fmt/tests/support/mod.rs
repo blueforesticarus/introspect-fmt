@@ -196,7 +196,9 @@ fn add_metadata(command: &mut Command, name: &str, library: &std::path::Path) {
 fn cargo_artifacts(executable: &std::path::Path) -> (PathBuf, Vec<PathBuf>) {
     let profile = executable
         .ancestors()
-        .find(|path| path.join("deps").is_dir())
+        // Current nightly Cargo may omit deps/ entirely; build/ still marks
+        // the profile directory in its per-package artifact layout.
+        .find(|path| path.join("deps").is_dir() || path.join("build").is_dir())
         .unwrap();
     let hash = executable
         .file_stem()

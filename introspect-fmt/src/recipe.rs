@@ -62,15 +62,34 @@ impl Recipe {
         })
     }
     /// Whether `format` can be captured with this recipe. Literal templates
-    /// compare by static address; runtime ones by source and argument names.
+    /// first compare by static address, then by resolved placeholder layout.
+    /// Runtime recipes also check argument names before reusing their indices.
     pub fn matches(&self, format: &Format<'_>) -> bool {
-        let same = match (&self.source, format.parsed()) {
-            (Source::Static(_, a), Some(b)) => std::ptr::eq(*a, b),
-            (Source::Owned(a), None) => a.matches(format),
-            _ => false,
-        };
         // Generic callsites share one template across differently typed instances.
-        same && self.kinds.iter().copied().eq(format.kinds())
+        if !self.kinds.iter().copied().eq(format.kinds()) {
+            return false;
+        }
+        match (&self.source, format.parsed()) {
+            (Source::Static(source, a), Some(b)) => {
+                // Cache hits compare only addresses; equivalent invocations
+                // fall back to comparing the source and resolved placeholders.
+                (std::ptr::eq(*a, b) && std::ptr::eq(*source, format.template()))
+                    || a.template(source) == b.template(format.template())
+            }
+            (Source::Owned(template), _) => template.matches(format),
+            (Source::Static(source, parsed), None) => {
+                // A manually rebuilt view can omit its static metadata. Compare
+                // resolved indices without allocating another owned recipe.
+                let template = parsed.template(source);
+                *source == format.template()
+                    && template.argument_count() == format.args().len()
+                    && crate::template::parse(format.template(), format.args()).eq(template
+                        .placeholders()
+                        .iter()
+                        .copied()
+                        .map(Ok))
+            }
+        }
     }
 
     pub fn template(&self) -> Template<'_> {
@@ -108,12 +127,13 @@ impl Recipe {
 
     /// Copy primitives and render opaque/pointer placeholders into `sink`.
     /// User formatting runs here, once per rendered placeholder.
+    /// Incompatible templates or argument schemas are rejected before writing.
     pub fn capture(
         &self,
         format: &Format<'_>,
         sink: &mut impl CaptureSink,
     ) -> Result<(), RenderError> {
-        if !self.kinds.iter().copied().eq(format.kinds()) {
+        if !self.matches(format) {
             return Err(RenderError::InvalidTemplate);
         }
         self.template().capture(format, sink)
